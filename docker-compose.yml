@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  adal-api:
+    build: .
+    image: adal:latest
+    container_name: adal-api
+    ports:
+      - "${API_PORT:-8000}:${API_PORT:-8000}"
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
+      - CUSTOM_API_KEY=${CUSTOM_API_KEY:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-deepseek}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-v4-pro}
+      - REASONING_EFFORT=${REASONING_EFFORT:-max}
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/adal.db
+      - MEMORY_DB_PATH=/app/data/memory_vault.lance
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - API_PORT=${API_PORT:-8000}
+    volumes:
+      - adal_data:/app/data
+      - ./.env:/app/.env:ro
+    command: api
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/api/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  adal_data:
+    name: adal_data
