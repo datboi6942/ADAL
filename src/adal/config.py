@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,6 +10,16 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @field_validator("database_url")
+    @classmethod
+    def _resolve_db_path(cls, v: str) -> str:
+        if v.startswith("sqlite+aiosqlite:///"):
+            parts = v.split("///", 1)
+            if len(parts) == 2 and parts[1] and not parts[1].startswith("/"):
+                absolute = Path(parts[1]).resolve()
+                return f"sqlite+aiosqlite:///{absolute}"
+        return v
 
     llm_provider: str = "deepseek"
 
@@ -28,6 +39,12 @@ class Settings(BaseSettings):
     custom_api_key: str = ""
     custom_base_url: str = ""
     custom_model: str = ""
+
+    deepseek_sub_model: str = "deepseek-v4-chat"
+    openai_sub_model: str = "gpt-4o-mini"
+    openrouter_sub_model: str = ""
+    ollama_sub_model: str = ""
+    custom_sub_model: str = ""
 
     llm_model: str = ""
     llm_max_tokens: int = 65536
@@ -84,9 +101,27 @@ class Settings(BaseSettings):
     fetch_max_retries: int = 3
     fetch_timeout: float = 25.0
 
-    llm_max_tool_turns: int = 6
+    llm_max_tool_turns: int = 12
     agent_llm_retry_count: int = 2
     orchestrator_pivot_threshold: int = 3
+
+    planner_max_tool_turns: int = 2
+    planner_initial_tool_turns: int = 0
+    proposer_max_tool_turns: int = 6
+    verifier_max_tool_turns: int = 6
+    self_critique_max_tool_turns: int = 3
+    deep_verify_max_tool_turns: int = 3
+    revise_max_tool_turns: int = 3
+
+    planner_timeout: float = 60.0
+    proposer_timeout: float = 120.0
+    verifier_timeout: float = 90.0
+    self_critique_timeout: float = 30.0
+    deep_verify_timeout: float = 45.0
+    revise_timeout: float = 45.0
+
+    max_parallel_tools: int = 2
+    tool_fail_streak_limit: int = 3
 
     memory_enrich_context_cap: int = 3
     memory_index_min_rows: int = 256

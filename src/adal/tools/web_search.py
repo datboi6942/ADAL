@@ -19,6 +19,7 @@ logger = structlog.get_logger(__name__)
 _last_request_time: float = 0.0
 _query_cache: dict[str, str] = {}
 _after_rate_limit: bool = False
+_search_lock = asyncio.Lock()
 
 
 def _get_blocked_hosts() -> set[str]:
@@ -63,7 +64,7 @@ class _TextExtractor(HTMLParser):
                 self.text.append(stripped)
 
 
-async def async_search_web(query: str, max_results: int | None = None) -> str:
+async def async_search_web(query: str, max_results: int | None = None, _cache: dict | None = None) -> str:
     """Search the web and return structured results with retry on server
     errors. Falls back to Wikipedia opensearch on persistent DDG failure."""
     if max_results is None:
@@ -71,68 +72,70 @@ async def async_search_web(query: str, max_results: int | None = None) -> str:
 
     logger.info("web_search", query=query[:100])
 
+    cache = _cache if _cache is not None else _query_cache
     cache_key = f"{query.strip().lower()}|{max_results}"
-    if cache_key in _query_cache:
+    if cache_key in cache:
         logger.debug("web_search_cache_hit", query=query[:100])
-        return _query_cache[cache_key]
+        return cache[cache_key]
 
-    global _last_request_time, _after_rate_limit
-    elapsed = _time.time() - _last_request_time
-    min_delay = settings.search_throttle_delay * (2.0 if _after_rate_limit else 1.0)
-    if elapsed < min_delay:
-        await asyncio.sleep(min_delay - elapsed)
+    async with _search_lock:
+        global _last_request_time, _after_rate_limit
+        elapsed = _time.time() - _last_request_time
+        min_delay = settings.search_throttle_delay * (2.0 if _after_rate_limit else 1.0)
+        if elapsed < min_delay:
+            await asyncio.sleep(min_delay - elapsed)
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(settings.search_timeout)) as client:
-        for attempt in range(settings.search_max_retries):
-            try:
-                ua = random.choice(USER_AGENTS)
-                _last_request_time = _time.time()
-                resp = await client.get(
-                    "https://html.duckduckgo.com/html/",
-                    params={"q": query},
-                    headers={"User-Agent": ua},
-                    follow_redirects=True,
-                )
-                if resp.status_code in (202, 429):
-                    _after_rate_limit = True
-                    wait = 2 ** attempt
-                    logger.info("web_search_rate_limited", attempt=attempt, wait=wait)
-                    await asyncio.sleep(wait)
-                    continue
-                if resp.status_code in (500, 502, 503, 504):
-                    wait = 2 ** attempt
-                    logger.info("web_search_server_error", attempt=attempt, status=resp.status_code, wait=wait)
-                    await asyncio.sleep(wait)
-                    continue
-                if resp.status_code != 200:
-                    logger.info("web_search_non_200", status=resp.status_code, query=query[:100])
-                    continue
+        async with httpx.AsyncClient(timeout=httpx.Timeout(settings.search_timeout)) as client:
+            for attempt in range(settings.search_max_retries):
+                try:
+                    ua = random.choice(USER_AGENTS)
+                    _last_request_time = _time.time()
+                    resp = await client.get(
+                        "https://html.duckduckgo.com/html/",
+                        params={"q": query},
+                        headers={"User-Agent": ua},
+                        follow_redirects=True,
+                    )
+                    if resp.status_code in (202, 429):
+                        _after_rate_limit = True
+                        wait = 2 ** attempt
+                        logger.info("web_search_rate_limited", attempt=attempt, wait=wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status_code in (500, 502, 503, 504):
+                        wait = 2 ** attempt
+                        logger.info("web_search_server_error", attempt=attempt, status=resp.status_code, wait=wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status_code != 200:
+                        logger.info("web_search_non_200", status=resp.status_code, query=query[:100])
+                        continue
 
-                results = _parse_ddg(resp.text, max_results)
-                if not results:
-                    logger.warning("web_search_empty_results", query=query[:100])
-                for r in results:
-                    r["url"] = _clean_ddg_url(r["url"])
-                result = json.dumps({"query": query, "results": results, "source": "duckduckgo"}, ensure_ascii=False)
-                _query_cache[cache_key] = result
-                _after_rate_limit = False
-                return result
+                    results = _parse_ddg(resp.text, max_results)
+                    if not results:
+                        logger.warning("web_search_empty_results", query=query[:100])
+                    for r in results:
+                        r["url"] = _clean_ddg_url(r["url"])
+                    result = json.dumps({"query": query, "results": results, "source": "duckduckgo"}, ensure_ascii=False)
+                    cache[cache_key] = result
+                    _after_rate_limit = False
+                    return result
 
-            except httpx.TimeoutException:
-                if attempt < 2:
-                    logger.info("web_search_timeout_retry", attempt=attempt)
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-            except Exception as e:
-                if attempt < 2:
-                    logger.info("web_search_error_retry", attempt=attempt, error=str(e))
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                logger.error("web_search_failed", error=str(e))
-                break
+                except httpx.TimeoutException:
+                    if attempt < 2:
+                        logger.info("web_search_timeout_retry", attempt=attempt)
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                except Exception as e:
+                    if attempt < 2:
+                        logger.info("web_search_error_retry", attempt=attempt, error=str(e))
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    logger.error("web_search_failed", error=str(e))
+                    break
 
-        logger.info("web_search_fallback", provider="wikipedia", query=query[:100])
-        return await _wikipedia_search(query, max_results)
+            logger.info("web_search_fallback", provider="wikipedia", query=query[:100])
+            return await _wikipedia_search(query, max_results)
 
 
 async def _wikipedia_search(query: str, max_results: int | None = None) -> str:
@@ -173,12 +176,17 @@ async def _wikipedia_search(query: str, max_results: int | None = None) -> str:
         return json.dumps({"error": f"All search providers failed: {e}", "query": query})
 
 
-async def async_fetch_url(url: str, max_chars: int | None = None) -> str:
+async def async_fetch_url(url: str, max_chars: int | None = None, _cache: dict | None = None) -> str:
     """Fetch and extract text content from a URL with retry and sanitization."""
     if max_chars is None:
         max_chars = settings.fetch_max_chars
     url = _clean_ddg_url(url)
     logger.info("web_fetch", url=url[:100])
+
+    if _cache is not None:
+        cache_key = url
+        if cache_key in _cache:
+            return _cache[cache_key]
 
     host = _urlparse(url).hostname or ""
     if host in _get_blocked_hosts():
@@ -216,7 +224,10 @@ async def async_fetch_url(url: str, max_chars: int | None = None) -> str:
                 else:
                     text = resp.text[:max_chars]
 
-                return json.dumps({"url": url, "content": text, "length": len(text)}, ensure_ascii=False)
+                result = json.dumps({"url": url, "content": text, "length": len(text)}, ensure_ascii=False)
+                if _cache is not None and result:
+                    _cache[url] = result
+                return result
 
         except httpx.TimeoutException:
             if attempt < 2:

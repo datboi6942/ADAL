@@ -10,6 +10,7 @@ from adal.db.models import Domain
 from adal.prompts.planner import PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE
 from adal.tools.web_search import TOOL_DEFINITIONS as WEB_TOOLS
 from adal.tools.web_search import TOOL_EXECUTORS
+from adal.tui.widgets.debug_panel import VERBOSITY_HIGH, VERBOSITY_LOW, VERBOSITY_MED  # noqa: F401
 
 logger = structlog.get_logger(__name__)
 
@@ -67,10 +68,10 @@ class Planner(BaseAgent):
     role = "planner"
     system_prompt = PLANNER_SYSTEM_PROMPT
 
-    def __init__(self, model: str | None = None):
-        super().__init__(model=model)
+    def __init__(self, model: str | None = None, sub_model: str | None = None):
+        super().__init__(model=model, sub_model=sub_model)
         self.tools = WEB_TOOLS
-        self.tool_executors = TOOL_EXECUTORS
+        self.tool_executors = dict(TOOL_EXECUTORS)
         self.gen_params = {
             "temperature": settings.planner_temperature,
             "top_p": settings.planner_top_p,
@@ -82,9 +83,9 @@ class Planner(BaseAgent):
         if settings.planner_seed is not None:
             self.gen_params["seed"] = settings.planner_seed
 
-    async def _think_smart(self, context: dict) -> str:
+    async def _think_smart(self, context: dict, thinking_enabled: bool = True, model: str | None = None, max_tool_turns: int | None = None, timeout_seconds: float | None = None) -> str:
         if self.tools:
-            return await self.think_with_tools(context)
+            return await self.think_with_tools(context, thinking_enabled=thinking_enabled, model=model, max_tool_turns=max_tool_turns or settings.planner_max_tool_turns, timeout_seconds=timeout_seconds or settings.planner_timeout)
         return await self.think_with_retry(context)
 
     def classify_domain(self, query: str) -> Domain:
@@ -117,6 +118,7 @@ class Planner(BaseAgent):
             if max(weighted.values()) == 0:
                 best = tied[0]
 
+        self._last_domain_scores = scores
         logger.info("domain_classified", domain=best.value, scores=scores)
         return best
 
@@ -126,31 +128,52 @@ class Planner(BaseAgent):
         state: dict[str, Any],
         verdict: dict[str, Any] | None = None,
         hypotheses_history: list[dict] | None = None,
+        max_tool_turns: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         context = {
             "user_query": user_query,
             "state_json": json.dumps(state, indent=2),
             "verdict_json": json.dumps(verdict, indent=2) if verdict else "None (initial planning)",
             "hypotheses_history": json.dumps(hypotheses_history, indent=2) if hypotheses_history else "[]",
+            "proposer_summary": state.get("proposer_summary", ""),
+            "sandbox_success": str(state.get("sandbox_success", False)),
+            "sandbox_stdout": state.get("sandbox_stdout", ""),
+            "prior_failures_count": str(state.get("prior_failures_count", 0)),
+            "validated_count": str(state.get("validated_count", 0)),
         }
 
         self.log.info("planner_thinking", iteration=state.get("iteration", 0))
-        response = await self._think_smart(context)
+        if self._debug_callback:
+            await self._debug_callback("planner", "state",
+                f"Iter {state.get('iteration', 0)}: failures={state.get('prior_failures_count', 0)} "
+                f"validated={state.get('validated_count', 0)} "
+                f"sandbox={'OK' if state.get('sandbox_success') == 'True' else 'FAIL' if state.get('sandbox_success') == 'False' else 'N/A'} "
+                f"proposer_summary={'present' if state.get('proposer_summary') else 'none'}",
+                verbosity=VERBOSITY_MED)
+        response = await self._think_smart(context, max_tool_turns=max_tool_turns, timeout_seconds=timeout_seconds)
         result = self.parse_json_block(response)
 
         if "error" in result:
             self.log.error("planner_parse_failed", error=result["error"])
+            if self._debug_callback:
+                await self._debug_callback("planner", "retry",
+                    f"Parse failed: {result['error'][:200]} — retrying with JSON format reminder",
+                    verbosity=VERBOSITY_MED)
             retry_context = {**context}
             retry_context["_retry_note"] = (
                 "\n\n[SYSTEM NOTE: Your previous response was not valid JSON. "
                 "You MUST output a complete, valid JSON object with ALL required fields. "
                 "Check for unescaped quotes, trailing commas, or missing closing brackets.]"
             )
-            response = await self._think_smart(retry_context)
+            response = await self._think_smart(retry_context, thinking_enabled=False, model=self.sub_model, max_tool_turns=max_tool_turns, timeout_seconds=timeout_seconds)
             result = self.parse_json_block(response)
 
         if result.get("error"):
             self.log.error("planner_fatal_parse_failure", error=result["error"])
+            if self._debug_callback:
+                await self._debug_callback("planner", "fatal_parse",
+                    f"Fatal: could not parse after retry — {result['error'][:200]}", verbosity=VERBOSITY_MED)
             result = {
                 "action": "continue",
                 "session_status": "ACTIVE",
@@ -165,6 +188,14 @@ class Planner(BaseAgent):
 
     async def initial_plan(self, user_query: str) -> dict[str, Any]:
         domain = self.classify_domain(user_query)
+        if self._debug_callback:
+            scores = self._last_domain_scores if hasattr(self, '_last_domain_scores') else {}
+            await self._debug_callback("planner", "domain",
+                f"Classified as {domain.value.upper()} — query: {user_query[:150]}", verbosity=VERBOSITY_MED)
+            if scores:
+                score_str = ", ".join(f"{d.value}={s}" for d, s in scores.items() if s > 0)
+                await self._debug_callback("planner", "domain_scores",
+                    f"Keyword match scores: {score_str}", verbosity=VERBOSITY_MED)
         initial_state = {
             "iteration": 0,
             "status": "active",
@@ -176,6 +207,8 @@ class Planner(BaseAgent):
             state=initial_state,
             verdict=None,
             hypotheses_history=[],
+            max_tool_turns=settings.planner_initial_tool_turns,
+            timeout_seconds=settings.planner_timeout,
         )
         result["domain_classification"] = domain.value
         return result
@@ -186,6 +219,11 @@ class Planner(BaseAgent):
             user_query=context["user_query"],
             state_json=context["state_json"],
             verdict_json=context["verdict_json"],
+            proposer_summary=context.get("proposer_summary", ""),
+            sandbox_success=context.get("sandbox_success", "False"),
+            sandbox_stdout=context.get("sandbox_stdout", ""),
+            prior_failures_count=context.get("prior_failures_count", "0"),
+            validated_count=context.get("validated_count", "0"),
             hypotheses_history=context["hypotheses_history"],
         )
         retry = context.get("_retry_note", "")

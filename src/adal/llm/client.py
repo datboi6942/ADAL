@@ -1,11 +1,14 @@
+import asyncio
 import inspect
 import json
+import time as _time
 from dataclasses import dataclass, field
 
 import structlog
 from openai import AsyncOpenAI
 
 from adal.config import settings
+from adal.tui.widgets.debug_panel import VERBOSITY_HIGH, VERBOSITY_MED
 
 logger = structlog.get_logger(__name__)
 
@@ -28,11 +31,26 @@ def _resolve_provider() -> tuple[str, str, str]:
     raise ValueError(f"Unknown LLM provider: {p}")
 
 
-def _provider_kwargs(gen_params: dict | None = None) -> dict:
+def _resolve_sub_model() -> str:
+    p = settings.llm_provider
+    if p == "deepseek":
+        return settings.deepseek_sub_model or settings.deepseek_model
+    elif p == "openai":
+        return settings.openai_sub_model or settings.openai_model
+    elif p == "openrouter":
+        return settings.openrouter_sub_model or settings.openrouter_model
+    elif p == "ollama":
+        return settings.ollama_sub_model or settings.ollama_model
+    elif p == "custom":
+        return settings.custom_sub_model or settings.custom_model
+    return ""
+
+
+def _provider_kwargs(gen_params: dict | None = None, thinking_enabled: bool = True) -> dict:
     kwargs: dict = {}
     if gen_params:
         kwargs.update({k: v for k, v in gen_params.items() if v is not None})
-    if settings.llm_provider == "deepseek":
+    if thinking_enabled and settings.llm_provider == "deepseek":
         kwargs["reasoning_effort"] = settings.reasoning_effort
         kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
     return kwargs
@@ -87,6 +105,19 @@ def _calculate_cost(usage: dict) -> dict:
     }
 
 
+def _tool_failed(result_content: str) -> bool:
+    if not result_content or not result_content.strip():
+        return True
+    lower = result_content.lower()
+    if '"error"' in lower:
+        return True
+    if any(phrase in lower for phrase in
+           ['http 403', 'http 404', 'timed out', 'pdf content cannot be extracted',
+            'all search providers failed', 'status: 403', 'status: 404']):
+        return True
+    return False
+
+
 async def chat_completion(
     system_prompt: str,
     user_message: str,
@@ -94,14 +125,20 @@ async def chat_completion(
     model: str | None = None,
     max_tokens: int | None = None,
     gen_params: dict | None = None,
+    thinking_enabled: bool = True,
+    debug_callback=None,
 ) -> LLMResponse:
     client = get_client()
     _, _, default_model = _resolve_provider()
     tokens = max_tokens or settings.llm_max_tokens
     effective_model = model or default_model
+    if debug_callback:
+        await debug_callback("llm", "call",
+            f"Model={effective_model} thinking={thinking_enabled} tokens={tokens} prompt_len={len(user_message)}",
+            verbosity=VERBOSITY_MED)
     logger.debug("LLM request", model=effective_model, max_tokens=tokens, msg_preview=user_message[:200])
 
-    kwargs = _provider_kwargs(gen_params)
+    kwargs = _provider_kwargs(gen_params, thinking_enabled=thinking_enabled)
     kwargs.update({
         "model": effective_model,
         "messages": [
@@ -116,6 +153,19 @@ async def chat_completion(
     content = message.content or ""
     reasoning = getattr(message, "reasoning_content", None)
     usage = _extract_usage(response)
+
+    if debug_callback:
+        await debug_callback("llm", "response",
+            f"Reply: {len(content)} chars, {usage.get('total_tokens', 0)} tokens "
+            f"(prompt={usage.get('prompt_tokens', 0)}, comp={usage.get('completion_tokens', 0)})",
+            verbosity=VERBOSITY_MED)
+    if debug_callback and content:
+        has_braces = '{' in content and '}' in content
+        has_brackets = '[' in content and ']' in content
+        if has_braces or has_brackets:
+            await debug_callback("llm", "json_detect",
+                f"Response contains {'JSON object' if has_braces else 'JSON array'} — {content[:200]}",
+                verbosity=VERBOSITY_HIGH)
 
     if reasoning:
         logger.debug("LLM reasoning", length=len(reasoning), preview=reasoning[:300])
@@ -132,15 +182,24 @@ async def chat_completion_with_tools(
     *,
     model: str | None = None,
     max_tokens: int | None = None,
-    max_tool_turns: int = 6,
+    max_tool_turns: int = settings.llm_max_tool_turns,
     gen_params: dict | None = None,
+    thinking_enabled: bool = True,
+    debug_callback=None,
+    timeout_seconds: float | None = None,
 ) -> LLMResponse:
     client = get_client()
     _, _, default_model = _resolve_provider()
     tokens = max_tokens or settings.llm_max_tokens
     model_name = model or default_model
+    _start_time = _time.time()
 
-    base_kwargs = _provider_kwargs(gen_params)
+    if debug_callback:
+        await debug_callback("llm", "call",
+            f"Model={model_name} thinking={thinking_enabled} tokens={tokens} tools={len(tools)} turns={max_tool_turns}",
+            verbosity=VERBOSITY_MED)
+
+    base_kwargs = _provider_kwargs(gen_params, thinking_enabled=thinking_enabled)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -149,8 +208,19 @@ async def chat_completion_with_tools(
     total_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
     final_reasoning: str | None = None
     final_content: str = ""
+    tool_fail_streak = 0
 
     for turn in range(max_tool_turns):
+        if timeout_seconds is not None and (_time.time() - _start_time) > timeout_seconds:
+            if debug_callback:
+                await debug_callback("llm", "timeout",
+                    f"Agent timeout ({timeout_seconds}s) exceeded after {turn} turns — forcing final answer",
+                    verbosity=1)
+            break
+        if debug_callback:
+            await debug_callback("llm", "turn",
+                f"Turn {turn+1}/{max_tool_turns} — requesting LLM completion (msg_count={len(messages)})",
+                verbosity=VERBOSITY_MED)
         logger.debug("tool_turn", turn=turn + 1, model=model_name)
         response = await client.chat.completions.create(
             model=model_name,
@@ -176,38 +246,84 @@ async def chat_completion_with_tools(
         messages.append(msg)
 
         tool_calls = msg.tool_calls
-        if not tool_calls:
+        if tool_calls:
+            if len(tool_calls) > settings.max_parallel_tools:
+                if debug_callback:
+                    await debug_callback("llm", "parallel_limit",
+                        f"Limiting {len(tool_calls)} tool calls to {settings.max_parallel_tools}",
+                        verbosity=2)
+                skipped = tool_calls[settings.max_parallel_tools:]
+                tool_calls = tool_calls[:settings.max_parallel_tools]
+                for tc in skipped:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps({"error": f"skipped — parallel limit ({settings.max_parallel_tools}) reached, re-request this tool next turn"}),
+                    })
+            if debug_callback:
+                tool_names = [tc.function.name for tc in tool_calls]
+                await debug_callback("llm", "tools_requested",
+                    f"Turn {turn+1}: LLM requested {len(tool_calls)} tools: {', '.join(tool_names)}",
+                    verbosity=VERBOSITY_MED)
+        else:
+            if debug_callback:
+                await debug_callback("llm", "no_tools",
+                    f"Turn {turn+1}: LLM returned content without tool calls — exiting tool loop",
+                    verbosity=VERBOSITY_MED)
             break
 
-        for tc in tool_calls:
+        async def _run_one_tool(tc):
             executor = tool_executors.get(tc.function.name)
-            if executor:
+            if not executor:
+                return {"tool_call_id": tc.id, "content": json.dumps({"error": f"Unknown tool: {tc.function.name}"})}
+            try:
+                args = json.loads(tc.function.arguments)
+                if inspect.iscoroutinefunction(executor):
+                    result = await executor(**args)
+                else:
+                    result = executor(**args)
+            except TypeError as e:
                 try:
-                    args = json.loads(tc.function.arguments)
-                    if inspect.iscoroutinefunction(executor):
-                        result = await executor(**args)
-                    else:
-                        result = executor(**args)
-                except TypeError as e:
-                    try:
-                        sig = inspect.signature(executor)
-                        param_str = ", ".join(f"{n}: {p.annotation.__name__ if p.annotation != inspect.Parameter.empty else 'str'}" for n, p in sig.parameters.items())
-                        hint = f"Correct signature: {tc.function.name}({param_str})"
-                    except (ValueError, TypeError, AttributeError):
-                        hint = f"Check the function signature for {tc.function.name}"
-                    result = json.dumps({"error": str(e), "hint": hint, "function": tc.function.name})
-                    logger.debug("tool_type_error", name=tc.function.name, error=str(e))
-                except Exception as e:
-                    result = json.dumps({"error": str(e)})
-                logger.debug("tool_result", name=tc.function.name, result_preview=str(result)[:200])
-            else:
-                result = json.dumps({"error": f"Unknown tool: {tc.function.name}"})
+                    sig = inspect.signature(executor)
+                    param_str = ", ".join(f"{n}: {p.annotation.__name__ if p.annotation != inspect.Parameter.empty else 'str'}" for n, p in sig.parameters.items())
+                    hint = f"Correct signature: {tc.function.name}({param_str})"
+                except (ValueError, TypeError, AttributeError):
+                    hint = f"Check the function signature for {tc.function.name}"
+                result = json.dumps({"error": str(e), "hint": hint, "function": tc.function.name})
+                logger.debug("tool_type_error", name=tc.function.name, error=str(e))
+            except Exception as e:
+                result = json.dumps({"error": str(e)})
+            logger.debug("tool_result", name=tc.function.name, result_preview=str(result)[:200])
+            return {"tool_call_id": tc.id, "content": result}
 
+        results = await asyncio.gather(*[_run_one_tool(tc) for tc in tool_calls])
+        any_failed = any(_tool_failed(r.get("content", "")) for r in results)
+        if any_failed:
+            tool_fail_streak += 1
+        else:
+            tool_fail_streak = 0
+
+        if tool_fail_streak >= settings.tool_fail_streak_limit:
+            if debug_callback:
+                await debug_callback("llm", "fail_streak",
+                    f"{tool_fail_streak} consecutive tool failures — forcing final answer",
+                    verbosity=1)
+            break
+        for r in results:
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result,
-            }            )
+                "tool_call_id": r["tool_call_id"],
+                "content": r["content"],
+            })
+
+    if debug_callback and not final_content:
+        stripped_count = sum(1 for m in messages if
+            (isinstance(m, dict) and m.get('role') in ('tool',)) or
+            (hasattr(m, 'tool_calls') and getattr(m, 'tool_calls', None)))
+        await debug_callback("llm", "forced_answer",
+            f"No content after {turn+1} tool turns — forcing final answer. "
+            f"Stripping {stripped_count} tool messages, thinking DISABLED, temperature={settings.forced_answer_temperature}",
+            verbosity=VERBOSITY_MED)
 
     if not final_content:
         logger.info("forcing_final_answer")
@@ -221,7 +337,16 @@ async def chat_completion_with_tools(
                 if role == "assistant" and hasattr(m, "tool_calls") and getattr(m, "tool_calls", None):
                     continue
                 clean_messages.append({"role": role or "assistant", "content": content or ""})
-            clean_messages.append({"role": "user", "content": "Output your final JSON response now. No tools, no reasoning, no disclaimers, no ethical commentary, no legal warnings — ONLY the scientific JSON content requested."})
+            _fail_count = sum(1 for m in messages
+                if isinstance(m, dict) and m.get('role') == 'tool'
+                and _tool_failed(str(m.get('content', ''))))
+            _warning = ""
+            if _fail_count > 0:
+                _warning = (f" You attempted {len(messages)//2} tool calls over {turn+1} turns with "
+                            f"{_fail_count} failures (HTTP errors, timeouts, dead URLs). "
+                            f"Dead URLs and failed searches are NOT a reason to search for more. ")
+            clean_messages.append({"role": "user", "content":
+                _warning + "Output your final JSON response now. No tools, no reasoning, no disclaimers, no ethical commentary, no legal warnings — ONLY the scientific JSON content requested."})
             response = await client.chat.completions.create(
                 model=model_name,
                 messages=clean_messages,

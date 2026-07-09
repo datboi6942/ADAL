@@ -1,4 +1,5 @@
 import asyncio
+import sys
 
 import structlog
 import typer
@@ -34,8 +35,9 @@ async def _ensure_db():
 def _init_db_sync():
     try:
         asyncio.run(_ensure_db())
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"FATAL: Database initialization failed — {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 @app.callback(invoke_without_command=True)

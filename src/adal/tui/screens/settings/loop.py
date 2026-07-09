@@ -21,6 +21,12 @@ class LoopSettingsScreen(Screen):
             yield Label("Pivot Threshold")
             yield Input(value=str(settings.orchestrator_pivot_threshold), placeholder="3", id="pivot-threshold")
             yield Label("  [dim]Consecutive identical failures before auto-PIVOT[/dim]")
+            yield Label("Max Parallel Tools")
+            yield Input(value=str(settings.max_parallel_tools), placeholder="2", id="max-parallel-tools")
+            yield Label("  [dim]Max tools executed per LLM turn[/dim]")
+            yield Label("Tool Fail Streak Limit")
+            yield Input(value=str(settings.tool_fail_streak_limit), placeholder="3", id="tool-fail-limit")
+            yield Label("  [dim]Consecutive tool failures before forced answer[/dim]")
             yield Button("\U0001f4be Save", id="save-loop", variant="primary")
         yield Footer()
 
@@ -31,6 +37,8 @@ class LoopSettingsScreen(Screen):
             ("max-tool-turns", "LLM_MAX_TOOL_TURNS"),
             ("llm-retry-count", "AGENT_LLM_RETRY_COUNT"),
             ("pivot-threshold", "ORCHESTRATOR_PIVOT_THRESHOLD"),
+            ("max-parallel-tools", "MAX_PARALLEL_TOOLS"),
+            ("tool-fail-limit", "TOOL_FAIL_STREAK_LIMIT"),
         ]:
             val = self.query_one(f"#{field_id}", Input).value.strip()
             if val:

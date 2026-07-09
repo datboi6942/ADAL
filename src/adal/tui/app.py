@@ -41,6 +41,13 @@ Press **F2** to open the command palette, then type to search:
 - **History** — view past research sessions
 - **Library** — browse validated synthesis procedures
 - **New Session** — start a fresh research session
+
+## Slash Commands
+Type `/` in the query input for command suggestions:
+- `/help` — show commands
+- `/verbose` — toggle detailed output
+- `/theme <name>` — change theme
+- `/stop` — stop current run
 """
 
 THEMES = [
@@ -61,8 +68,8 @@ class HelpScreen(ModalScreen[None]):
         align: center middle;
     }
     #help-container {
-        width: 60;
-        max-height: 30;
+        width: 62;
+        max-height: 35;
         background: $surface;
         border: thick $primary;
         padding: 1 2;
@@ -86,6 +93,27 @@ class ADALApp(App):
     .agent-verifier { color: $secondary-lighten-1; }
     .agent-decision { color: $success; }
 
+    Screen {
+        align: center top;
+    }
+
+    DashboardScreen {
+        layout: grid;
+        grid-rows: 1fr auto 1 auto;
+        grid-columns: 1fr;
+    }
+    DashboardScreen.debug-max {
+        grid-rows: 0 auto 1 1fr;
+    }
+    SessionDetailScreen {
+        layout: grid;
+        grid-rows: 1fr auto 1 auto;
+        grid-columns: 1fr;
+    }
+    SessionDetailScreen.debug-max {
+        grid-rows: 0 auto 1 1fr;
+    }
+
     #chat-history {
         height: 1fr;
         padding: 0 2;
@@ -98,9 +126,22 @@ class ADALApp(App):
         border-top: none;
         border-bottom: none;
         border-right: none;
+        transition: border-left 0.3s in_out_cubic, opacity 0.3s in_out_cubic;
     }
     .chat-card:hover {
         border-left: solid $primary-lighten-1;
+    }
+    .chat-card.pulse-0 {
+        border-left: solid $accent;
+    }
+    .chat-card.pulse-1 {
+        border-left: solid $primary-lighten-1;
+    }
+    .chat-card.pulse-2 {
+        border-left: solid $secondary-lighten-1;
+    }
+    .chat-card.pulse-3 {
+        border-left: solid $primary-darken-1;
     }
     .chat-result {
         height: auto;
@@ -121,30 +162,117 @@ class ADALApp(App):
         background: $accent;
         color: $text;
     }
-    #query-input {
-        dock: bottom;
+    #query-area {
+        height: auto;
         margin: 0 2 1 2;
-        height: 3;
         background: $surface;
         border: solid $primary;
+        transition: border 0.3s in_out_cubic;
     }
-    #query-input:focus {
+    #query-area:focus-within {
         border: solid $accent;
     }
+    #query-input {
+        height: auto;
+        min-height: 3;
+        max-height: 8;
+        background: $surface;
+        border: none;
+    }
+    #query-input:focus-within {
+        border: none;
+    }
+    #suggestion-list {
+        height: auto;
+        max-height: 14;
+        background: $surface-darken-1;
+        padding: 0 1;
+        border-top: solid $primary-darken-1;
+        display: none;
+    }
+    #suggestion-list.visible {
+        display: block;
+    }
+    .suggestion-row {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+    }
+    .suggestion-row.selected {
+        background: $accent 20%;
+        color: $text;
+    }
+    .suggestion-cmd {
+        color: $accent;
+    }
+    .suggestion-desc {
+        color: $text-muted;
+        padding-left: 2;
+    }
     #status-line {
-        dock: bottom;
         height: 1;
         margin: 0 2 0 2;
         padding: 0 1;
         background: $surface;
+        overflow: hidden;
+    }
+    #status-line.idle {
+        background: $surface;
+    }
+    #status-line.running {
+        background: $warning 10%;
+    }
+    #status-line.done {
+        background: $success 10%;
+    }
+    #status-line.error-state {
+        background: $error 10%;
     }
     #status-text {
+        height: 1;
         width: 1fr;
+        min-width: 20;
     }
     .status-btn {
         min-width: 13;
+        min-height: 1;
         height: 1;
         padding: 0 1;
+    }
+    #verbose-btn.active {
+        background: $accent 20%;
+        color: $accent;
+    }
+    .debug-panel {
+        display: none;
+    }
+    .debug-panel.visible {
+        display: block;
+        height: auto;
+        min-height: 6;
+        max-height: 14;
+        border-top: solid $primary;
+        background: $surface-darken-1;
+    }
+    .debug-panel.visible.maximized {
+        height: 1fr;
+        min-height: 0;
+        max-height: 100%;
+    }
+    #debug-log {
+        height: 100%;
+        min-height: 4;
+        padding: 0 1;
+    }
+    .debug-panel.maximized #debug-log {
+        min-height: 0;
+    }
+    #debug-header {
+        height: 1;
+        background: $primary 20%;
+        color: $primary;
+        padding: 0 1;
+        text-style: bold;
     }
     #detail-content, #library-content,
     #model-settings, #memory-settings, #search-settings, #general-settings,
@@ -155,9 +283,6 @@ class ADALApp(App):
     }
     #domain-filter {
         margin: 0 0 1 0;
-    }
-    Screen {
-        align: center top;
     }
     """
 
@@ -247,9 +372,9 @@ class ADALApp(App):
             screen._query_running = False
             if hasattr(screen, "_stop_status_animation"):
                 screen._stop_status_animation()
-            screen.query_one("#query-input").disabled = False
-            screen.query_one("#query-input").focus()
-            screen.query_one("#loading-spinner").stop()
+            qi = screen.query_one("#query-input")
+            qi.disabled = False
+            qi.focus()
 
     def action_back(self):
         if len(self._screen_stack) > 1:
