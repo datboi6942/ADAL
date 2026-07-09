@@ -264,13 +264,17 @@ class Verifier(BaseAgent):
         if deep_checks:
             existing = {}
             for c in merged.get("checks_performed", []):
-                if isinstance(c, dict) and c.get("check_name"):
-                    existing[c["check_name"]] = c
+                if isinstance(c, dict):
+                    key = c.get("check_name") or c.get("check") or c.get("name")
+                    if key:
+                        existing[key] = c
             for check in deep_checks:
                 if isinstance(check, dict):
-                    name = check.get("check_name")
-                    if name and name in existing and check.get("result") in ("PASS", "FAIL"):
-                        existing[name] = check
+                    key = check.get("check_name") or check.get("check") or check.get("name")
+                    if key and key in existing and check.get("result") in ("PASS", "FAIL"):
+                        existing[key] = check
+                    elif key and key not in existing and check.get("result") in ("PASS", "FAIL"):
+                        merged.setdefault("checks_performed", []).append(check)
             merged["checks_performed"] = list(existing.values())
 
         deep_flaws = deep.get("fatal_flaws", [])

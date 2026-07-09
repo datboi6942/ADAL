@@ -576,6 +576,12 @@ class Orchestrator:
                     rev_usage = self._capture_usage(self.proposer)
                     state.total_usage = _merge_usage(state.total_usage, rev_usage)
 
+                    analysis_context = json.dumps({
+                        "summary": revised.get("analysis_summary", ""),
+                        "features": revised.get("features_detected", []),
+                        "execution": str(revised.get("execution_result", {}))[:2000],
+                    })
+
                     revised_verdict = await self._run_with_heartbeat("verifier", self.verifier.verify(
                         hypothesis=revised.get("hypothesis", {}),
                         analysis_context=analysis_context,
@@ -614,6 +620,20 @@ class Orchestrator:
                         verif_usage = _merge_usage(verif_usage, rev_verif_usage)
                         state.hypotheses[-1] = hypothesis_data
                         hypothesis_db.content = hypothesis_data
+                        hypothesis_db.status = HypothesisStatus.VERIFIED
+                        state.validated_results.append({
+                            "iteration": state.iteration,
+                            "hypothesis": hypothesis_data,
+                            "verdict": verdict_data,
+                        })
+                        await self._persist_validation(
+                            hypothesis_db.id, True, revised_verdict["confidence"], verdict_data,
+                        )
+                        verdict["_reasoning"] = self.verifier.last_reasoning
+                        await self._persist_interaction(
+                            state, verdict, AgentRole.VERIFIER,
+                            InteractionDirection.VERIFIER_TO_PLANNER, hypothesis_db.id,
+                        )
                         await self._display_step("proposer", "done", "Revision accepted — hypothesis now passes!")
                         if live_state:
                             live_state.token_info = _status_bar(state.total_usage, state.started_at)
