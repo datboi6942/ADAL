@@ -4,7 +4,7 @@
 
 **Model-Agnostic Multi-Agent Scientific Discovery Framework**
 
-*Planner → Proposer → Verifier — an FSM-driven research loop*
+*Planner → Proposer → Verifier — an FSM-driven research loop with revision, self-critique, and deep verification*
 
 [Textual TUI](#tui-reference) · [REST API](#api-reference) · [Docker](#docker-deployment) · [5 LLM Providers](#installation)
 
@@ -58,9 +58,20 @@ ADAL is a **model-agnostic multi-agent framework** for autonomous scientific dis
 | **Dual-mode** | Rich Textual TUI + headless FastAPI REST server |
 | **Model-agnostic** | DeepSeek (default), OpenAI, OpenRouter, Ollama, custom endpoints |
 | **4 science domains** | Chemistry, Astrophysics, Physics, Particle/Nuclear |
-| **Live reasoning** | Streaming chain-of-thought previews in the TUI |
+| **Sub-agent routing** | Secondary calls (self-critique, deep verify, revision) use cheaper sub-models with thinking disabled |
+| **Tool loop hardening** | Per-agent turn limits, wall-clock timeouts, failed-tool short-circuit, parallel tool limit |
+| **Live reasoning** | Streaming chain-of-thought previews + verbose tool call tracing in the TUI |
 | **Deterministic validation** | Domain validators run before the LLM — catching arithmetic and physical-law violations instantly |
+| **Two-phase verification** | Deep verification pass targets borderline checks with fresh LLM tool calls |
+| **Revision loop** | Proposer auto-fixes verifier-flagged issues within the same iteration |
+| **Self-critique** | Always-on quality gate with dedicated role-separated system prompt, limited tool turns |
+| **Three-tier debug panel** | F6 toggle, F7 copy, F8 cycle verbosity — LOW/MED/HIGH with persistent cross-screen buffer |
+| **Role-separated prompts** | Self-critique, revision, and deep verification use dedicated system prompts to prevent model confusion |
+| **Parallel tools** | Concurrent `web_search`, `fetch_url`, `calculate` execution with search serialization |
+| **Shared cache** | Session-scoped search + fetch cache shared across Planner, Proposer, Verifier |
 | **Vector memory** | LanceDB-powered episodic memory with chaff pruning + cross-session global lessons |
+| **Slash commands** | Type `/` in the query input for command suggestions with tab autocomplete |
+| **Verbose mode** | Toggle detailed agent reasoning, tool calls, and sandbox output inline |
 | **Sandbox execution** | Isolated Python subprocess with 28 allowed imports, security audit |
 | **Web search** | DDG search with Wikipedia fallback, fetch with HTML extraction, PubChem blocked by default |
 | **Session library** | Browse, search, and export validated procedures across all past sessions |
@@ -160,18 +171,27 @@ ADAL uses a **Python-controlled finite state machine**, not LLM-driven routing. 
 ```
 Iteration N:
   1. PLANNER issues directive → "Investigate reductive amination of ketone 3"
+        (sees sandbox output, proposer summary, and session progress stats)
   2. PROPOSER generates hypothesis → synthesis procedure + analysis script
-       ├── Runs Python script in sandbox (numpy, scipy, rdkit, etc.)
-       └── Self-critique: checks stoichiometry, yield, feasibility
+        ├── Self-critique (always-on): verifies claims against web data with tools
+        ├── Runs Python script in sandbox (numpy, scipy, rdkit, etc.)
+        └── If prior failures exist — includes their flaws in critique context
   3. VERIFIER validates:
-       ├── Deterministic checks (pre-LLM): math, conservation laws, thermodynamics
-       ├── LLM check: 14 fatal-flaw rules, equipment era, precursor availability
-       └── Verdict: PASS / PARTIAL / FAIL / INCONCLUSIVE
-  4. PLANNER decides next action:
-       ├── PASS + no new flaws → CONVERGE (stop, output result)
-       ├── FAIL with fatal flaws → PIVOT (change direction)
-       ├── PARTIAL → CONTINUE (iterate with feedback)
-       └── 3+ consecutive identical flaws → auto-PIVOT
+        ├── Deterministic checks (pre-LLM): math, conservation laws, thermodynamics
+        ├── LLM check: 14 fatal-flaw rules, equipment era, precursor availability
+        ├── Deep verification pass (conditional): re-verifies borderline checks
+        │   with fresh LLM tool calls if confidence < 0.85 or verdict is PARTIAL
+        └── Verdict: PASS / PARTIAL / FAIL / INCONCLUSIVE
+  4. REVISION (conditional):
+        ├── If PARTIAL with actionable suggestions and no fatal flaws:
+        │   Proposer fixes issues, re-verifies immediately
+        │   If revised hypothesis passes → saved; otherwise normal flow continues
+        └── Max 1 revision per iteration
+  5. PLANNER decides next action:
+        ├── PASS + no new flaws → CONVERGE (stop, output result)
+        ├── FAIL with fatal flaws → PIVOT (change direction)
+        ├── PARTIAL → CONTINUE (iterate with feedback)
+        └── 3+ consecutive identical flaws → auto-PIVOT
 ```
 
 #### FSM Actions
@@ -182,6 +202,7 @@ Iteration N:
 | **PIVOT** | FAIL verdict, fatal flaws, or 3+ consecutive identical failures | Change research direction |
 | **CONVERGE** | PASS verdict ≥ 0.80 confidence, no new fatal flaws | Stop loop, output final answer |
 | **FAIL** | Max iterations reached, unrecoverable errors | Stop loop, report failure |
+| **REVISE** | PARTIAL + actionable suggestions + no fatal flaws | Proposer fixes issues, re-verified immediately |
 
 ### Agent Details
 
@@ -206,10 +227,24 @@ If a fatal flaw is found deterministically, the LLM call is **skipped entirely**
 
 ### Tool Call Limits
 
-Each agent gets up to **6 tool turns** (configurable via `LLM_MAX_TOOL_TURNS`). After exhausting turns without producing content:
-- Tool messages are stripped from the context
-- Thinking mode is disabled (no `reasoning_effort`, no `extra_body`)
-- A hard prompt forces a JSON response at `forced_answer_temperature` (default 0.1)
+Each agent has configurable per-agent tool turn limits and wall-clock timeouts (configurable via Settings or `.env`):
+
+| Agent/Call | Tool Turns | Timeout | Default Model |
+|------------|-----------|---------|---------------|
+| Planner (initial) | 0 | 60s | `deepseek-v4-pro` |
+| Planner (decision) | 2 | 60s | `deepseek-v4-pro` |
+| Proposer | 6 | 120s | `deepseek-v4-pro` |
+| Verifier | 6 | 90s | `deepseek-v4-pro` |
+| Self-critique | 3 | 30s | `deepseek-v4-chat` (sub-model) |
+| Deep verify | 3 | 45s | `deepseek-v4-chat` (sub-model) |
+| Revise | 3 | 45s | `deepseek-v4-chat` (sub-model) |
+
+Additional guardrails:
+- **Failed-tool short-circuit**: 3 consecutive tool failures (HTTP 403, timeout, dead URL) → forced final answer
+- **Parallel tool limit**: Max 2 tools executed per LLM turn; excess are skipped with an error
+- **Forced final answer**: If tool turns, timeout, or fail streak is exceeded, tool messages are stripped, thinking mode is disabled, and a hard prompt with failure context is sent
+
+Sub-model calls (self-critique, deep verify, revision) use cheaper models with **thinking disabled** — configurable per provider in Settings > Model & Provider.
 
 ### Memory System
 
@@ -239,9 +274,13 @@ uv run adal          # Opens welcome screen
 | **F1** | Help — keybinding reference |
 | **F2** | Command palette — search all actions |
 | **F5** | Stop current research run |
+| **F6** | Cycle debug panel (hidden → minimized → maximized → hidden) |
+| **F7** | Copy debug log to clipboard |
+| **F8** | Cycle debug verbosity tier (LOW → MED → HIGH → LOW) |
 | **F9** | Go back to previous screen |
 | **Ctrl+D** | Cycle through 9 themes |
 | **Ctrl+,** | Open settings hub |
+| **/** | Slash commands — type in the query input for autocomplete |
 | **Q** | Quit |
 
 ### Screens
@@ -254,12 +293,19 @@ The main research interface.
 
 - **Chat History** — Scrollable feed of agent iteration cards. Each card shows:
   - Agent icon + role + iteration number
-  - **Reasoning preview** — streaming chain-of-thought text in italics
+  - **Reasoning preview** — streaming chain-of-thought text in italics (full text in verbose mode)
   - **Pulsing dots** (●○○○ → ○●○○ → ...) during agent thinking
   - **▸/▾ toggle** — click to expand/collapse card detail
-- **Query Input** — Bottom-docked text input. Enter to submit, Shift+Enter for newline
-- **Loading Spinner** — Animated rainbow ring (◜◝◞◟) during research
-- **Status Bar** — Current agent, elapsed time, iteration count
+  - **Confetti burst** — Unicode celebration on PASS verdict
+  - **Shake effect** — card oscillation on FAIL/error
+- **Query Input** — Bottom-docked multi-line TextArea with word wrapping:
+  - **Enter** — submit research query or slash command
+  - **Shift+Enter** — create a newline (for multi-line queries)
+  - **`/` prefix** — shows command suggestion dropdown with tab autocomplete
+- **Loading Spinner** — Animated 8-frame rainbow ring with glow during research
+- **Status Bar** — Current agent, elapsed time, iteration progress bar (█░░░ → ████)
+  - Color transitions: green (idle) → yellow (running) → green (done) → red (error)
+  - **Verbose ON/OFF** button — toggle detailed agent reasoning and tool call traces
 
 **Continue Research** enables follow-up questions that carry forward the previous session's context.
 
@@ -291,6 +337,27 @@ The command palette provides fuzzy-search access to all actions:
 - Export Last Result
 - Quit
 
+### Slash Commands (`/`)
+
+Type `/` in the query input for inline command suggestions with Tab autocomplete:
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show available slash commands |
+| `/verbose` | Toggle verbose mode (full reasoning, tool calls) |
+| `/theme <name>` | Change color theme (e.g., `/theme dracula`) |
+| `/stop` | Stop current research run |
+| `/clear` | Clear chat history |
+| `/export` | Export last result to `adal_export.md` |
+| `/settings` | Open settings hub |
+| `/history` | Browse past sessions |
+| `/library` | Browse validated procedures |
+| `/session <id>` | Load a session by ID |
+| `/model` | Show current LLM model |
+| `/status` | Show session runtime stats |
+| `/back` | Go to previous screen |
+| `/quit` | Exit ADAL |
+
 ---
 
 ## Settings Guide
@@ -307,6 +374,8 @@ Access settings via **Ctrl+,** or the command palette. All settings persist to `
 | Frequency Penalty | 0.3 / 0.0 / 0.0 | −2.0–2.0 | Penalize repeated tokens |
 | Presence Penalty | 0.2 / 0.0 / 0.1 | −2.0–2.0 | Penalize tokens already present |
 | Seed | (none) | integer | Set for reproducible outputs |
+| Max Tool Turns | 2 / 6 / 6 | 0–20 | Tool call budget per agent call |
+| Timeout (seconds) | 60 / 120 / 90 | 10–600 | Wall-clock bailout per agent call |
 | Forced Answer Temp | 0.1 | 0.0–1.0 | Temperature for forced final answer |
 
 ### Models
@@ -315,18 +384,23 @@ Access settings via **Ctrl+,** or the command palette. All settings persist to `
 |---------|---------|-------------|
 | Provider | DeepSeek | DeepSeek / OpenAI / OpenRouter / Ollama / Custom |
 | API Key | (from .env) | Provider-specific API key |
-| Model Name | deepseek-v4-pro | Model identifier |
+| Model Name | deepseek-v4-pro | Primary model for main agent calls |
 | Base URL | api.deepseek.com/v1 | API endpoint |
 | Max Tokens | 65536 | Max tokens per LLM call (DeepSeek supports ~350K) |
 | Reasoning Effort | max | DeepSeek chain-of-thought depth (max/high/medium/low) |
+| **Sub-Agent Models** | | Cheaper models for secondary calls (self-critique, deep verify, revise) |
+| DeepSeek Sub-Model | deepseek-v4-chat | Cheap model with thinking disabled |
+| OpenAI Sub-Model | gpt-4o-mini | Per-provider sub-model override |
 
 ### Loop Control
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Max Tool Turns | 6 | Web search + tool cycles before forced answer |
+| Max Tool Turns | 12 | Global default (overridden by per-agent limits) |
 | LLM Retry Count | 2 | Retries when LLM returns empty or bad output |
 | Pivot Threshold | 3 | Consecutive identical failures before auto-PIVOT |
+| Max Parallel Tools | 2 | Max tools executed per LLM turn |
+| Tool Fail Streak Limit | 3 | Consecutive tool failures before forced answer |
 
 ### Memory
 
@@ -355,6 +429,10 @@ Access settings via **Ctrl+,** or the command palette. All settings persist to `
 |---------|---------|-------------|
 | Max Iterations | 10 | Total research loop iterations |
 | Sandbox Timeout | 120s | Script execution time limit |
+| Planner Initial Tool Turns | 0 | Tool turns for initial domain classification (0 = no tools) |
+| Self-Critique Max Turns | 3 | Tool turns for proposer self-critique review |
+| Deep Verify Max Turns | 3 | Tool turns for deep verification pass |
+| Revise Max Turns | 3 | Tool turns for proposer revision pass |
 | Memory Context Cap | 3 | Max memories per prompt |
 | Memory Index Min Rows | 256 | Rows before LanceDB creates vector index |
 | Search Max Results | 5 | Results per web_search call |
@@ -745,13 +823,17 @@ Explanation: Low temperatures produce deterministic, consistent output. Setting 
 LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY=sk-or-v1-...
 OPENROUTER_MODEL=deepseek/deepseek-chat
-LLM_MAX_TOOL_TURNS=4
+PLANNER_MAX_TOOL_TURNS=1
+PROPOSER_MAX_TOOL_TURNS=3
+VERIFIER_MAX_TOOL_TURNS=3
+SELF_CRITIQUE_MAX_TOOL_TURNS=1
 MAX_ITERATIONS=5
 REASONING_EFFORT=low
 MEMORY_ENABLED=false
+DEEPSEEK_SUB_MODEL=deepseek-v4-chat
 ```
 
-Explanation: OpenRouter can be cheaper. Reducing tool turns and iterations caps token usage. Disabling memory skips embedding API calls. Lower reasoning effort reduces chain-of-thought tokens.
+Explanation: OpenRouter can be cheaper. Reducing per-agent tool turns and iterations caps token usage. Sub-model defaults to cheap `deepseek-v4-chat` for secondary calls. Disabling memory skips embedding API calls. Lower reasoning effort reduces chain-of-thought tokens.
 
 #### Local-Only — No Cloud Dependencies
 
@@ -769,7 +851,8 @@ Explanation: Runs entirely locally. Disable memory (requires OpenAI embeddings).
 ```ini
 REASONING_EFFORT=max
 MAX_ITERATIONS=15
-LLM_MAX_TOOL_TURNS=10
+PROPOSER_MAX_TOOL_TURNS=10
+VERIFIER_MAX_TOOL_TURNS=10
 LLM_MAX_TOKENS=65536
 SEARCH_MAX_RESULTS=10
 SEARCH_TIMEOUT=30
@@ -777,7 +860,7 @@ FETCH_MAX_CHARS=20000
 VERIFIER_TEMPERATURE=0.2
 ```
 
-Explanation: Maximizes research depth. More iterations, more web search results, longer fetched content, and stricter verification. Costs more in tokens and time.
+Explanation: Maximizes research depth. More iterations, more per-agent tool turns, more web search results, longer fetched content, and stricter verification. Costs more in tokens and time.
 
 #### High-Precision Physics — Reproducible Calculations
 
@@ -800,14 +883,16 @@ Explanation: Physics calculations benefit from precision over creativity. Top-K 
 ```ini
 REASONING_EFFORT=low
 MAX_ITERATIONS=3
-LLM_MAX_TOOL_TURNS=3
+PLANNER_MAX_TOOL_TURNS=1
+PROPOSER_MAX_TOOL_TURNS=3
+VERIFIER_MAX_TOOL_TURNS=3
 SEARCH_MAX_RESULTS=3
 SEARCH_TIMEOUT=10
 FETCH_MAX_CHARS=5000
 PROPOSER_TEMPERATURE=0.6
 ```
 
-Explanation: Fast iteration for initial exploration. Low reasoning effort skips deep chain-of-thought. Fewer turns and iterations keep things quick. Use this to survey possibilities before committing to a deep run.
+Explanation: Fast iteration for initial exploration. Low reasoning effort skips deep chain-of-thought. Per-agent turn limits keep tool usage minimal. Use this to survey possibilities before committing to a deep run.
 
 ### Pro Tips
 
@@ -817,15 +902,19 @@ Explanation: Fast iteration for initial exploration. Low reasoning effort skips 
 
 3. **Export early, export often** — Use Export Markdown to save results. Markdown files are human-readable and version-control friendly.
 
-4. **Tune per-agent temperatures independently** — The Proposer (0.7) is warmer than the Planner (0.4) and Verifier (0.3) by design. Don't set them all to the same value — each agent has a distinct role.
+4. **Tune per-agent temperatures independently** — The Proposer (0.7) is warmer than the Planner (0.4) and Verifier (0.3) by design. Don't set them all to the same value — each agent has a distinct role. Similarly, per-agent tool turn limits and timeouts should match the agent's role (Planner needs fewer tools than Proposer).
 
 5. **Seeds for reproducibility** — If you're comparing approaches or writing a paper, set all three agent seeds to the same integer. Identical queries + identical seeds = identical outputs.
 
-6. **Watch the reasoning previews** — The streaming reasoning text in the TUI shows you what the LLM is "thinking." It's the best debugging tool for understanding why a hypothesis was generated or rejected.
+6. **Use the debug panel** — Press **F6** to open the debug overlay. **F8** cycles through LOW/MED/HIGH verbosity. HIGH tier shows absolutely everything: memory injections, per-tool-call results, DB persistence, domain classification scores, and more. **F7** copies the full log to clipboard.
 
-7. **Blocked hosts are configurable** — PubChem is blocked by default to avoid fetching massive pages. Add your own blocked hosts as a comma-separated list if certain sites are problematic.
+7. **Sub-models save money** — Secondary calls (self-critique, deep verify, revision) automatically use cheaper models with thinking disabled. Configure per provider in Settings > Model & Provider. Set `DEEPSEEK_SUB_MODEL=deepseek-v4-chat` for maximum savings.
 
-8. **The sandbox is real Python** — The Proposer's analysis scripts execute in an isolated subprocess with numpy, scipy, rdkit, sklearn, and 24 other libraries. The script output (stdout/stderr) is captured and shown in the procedure detail view.
+8. **Watch the reasoning previews** — The streaming reasoning text in the TUI shows you what the LLM is "thinking." It's the best debugging tool for understanding why a hypothesis was generated or rejected.
+
+9. **Blocked hosts are configurable** — PubChem is blocked by default to avoid fetching massive pages. Add your own blocked hosts as a comma-separated list if certain sites are problematic.
+
+10. **The sandbox is real Python** — The Proposer's analysis scripts execute in an isolated subprocess with numpy, scipy, rdkit, sklearn, and 24 other libraries. The script output (stdout/stderr) is captured and shown in the procedure detail view.
 
 ---
 
@@ -883,12 +972,14 @@ ADAL has built-in anti-refusal detection. If an agent refuses a query (e.g., cit
 
 #### "Forced final answer" appearing frequently
 
-This means agents are hitting their tool-turn limit without producing content. Solutions:
+This means agents are hitting their tool-turn limit, timeout, or fail streak without producing content. Solutions:
 
-1. Increase `LLM_MAX_TOOL_TURNS` (default 6)
-2. Reduce `SEARCH_MAX_RESULTS` to speed up web searches
-3. Try a more capable model
-4. Simplify the query
+1. Increase per-agent tool turns (e.g., `PROPOSER_MAX_TOOL_TURNS=10`)
+2. Increase per-agent timeouts (e.g., `PROPOSER_TIMEOUT=300`)
+3. Reduce `SEARCH_MAX_RESULTS` to speed up web searches
+4. Try a more capable model
+5. Simplify the query
+6. Check if specific URLs are always failing (HTTP 403, timeout) — block them via `BLOCKED_FETCH_HOSTS`
 
 #### Ollama connection errors
 
@@ -982,7 +1073,17 @@ src/adal/
 ├── tools/           # Web search + fetch + calculate
 └── tui/             # Textual interface
     ├── screens/     # All screens (welcome, dashboard, settings, etc.)
-    └── widgets/     # Reusable widgets (chat_history, spinner, input)
+    └── widgets/     # Reusable widgets
+        ├── chat_history.py       # IterationCard + ChatHistory
+        ├── commands.py           # Slash command registry (16 commands)
+        ├── debug_panel.py        # Three-tier debug overlay (F6/F7/F8)
+        ├── loading_spinner.py    # Animated 8-frame spinner
+        ├── palette.py            # F2 command palette provider
+        ├── query_input.py        # CommandInput (TextArea with / commands)
+        ├── suggestion_list.py    # Autocomplete dropdown for slash commands
+        ├── status_bar.py         # Status bar widget
+        ├── reasoning_log.py      # Color-coded RichLog
+        └── synth_viewer.py       # Markdown procedure viewer
 ```
 
 ---

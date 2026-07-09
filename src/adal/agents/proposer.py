@@ -6,9 +6,15 @@ import structlog
 from adal.agents.base import BaseAgent
 from adal.config import settings
 from adal.execution.sandbox import run_script
-from adal.prompts.proposer import PROPOSER_SYSTEM_PROMPT, PROPOSER_USER_TEMPLATE
+from adal.prompts.proposer import (
+    PROPOSER_SYSTEM_PROMPT,
+    PROPOSER_USER_TEMPLATE,
+    REVISE_SYSTEM_PROMPT,
+    SELF_CRITIQUE_SYSTEM_PROMPT,
+)
 from adal.tools.web_search import TOOL_DEFINITIONS as WEB_TOOLS
 from adal.tools.web_search import TOOL_EXECUTORS
+from adal.tui.widgets.debug_panel import VERBOSITY_HIGH, VERBOSITY_LOW, VERBOSITY_MED  # noqa: F401
 
 logger = structlog.get_logger(__name__)
 
@@ -17,10 +23,10 @@ class Proposer(BaseAgent):
     role = "proposer"
     system_prompt = PROPOSER_SYSTEM_PROMPT
 
-    def __init__(self, model: str | None = None):
-        super().__init__(model=model)
+    def __init__(self, model: str | None = None, sub_model: str | None = None):
+        super().__init__(model=model, sub_model=sub_model)
         self.tools = WEB_TOOLS
-        self.tool_executors = TOOL_EXECUTORS
+        self.tool_executors = dict(TOOL_EXECUTORS)
         self.gen_params = {
             "temperature": settings.proposer_temperature,
             "top_p": settings.proposer_top_p,
@@ -32,9 +38,9 @@ class Proposer(BaseAgent):
         if settings.proposer_seed is not None:
             self.gen_params["seed"] = settings.proposer_seed
 
-    async def _think_smart(self, context: dict) -> str:
+    async def _think_smart(self, context: dict, thinking_enabled: bool = True, model: str | None = None, max_tool_turns: int | None = None, timeout_seconds: float | None = None) -> str:
         if self.tools:
-            return await self.think_with_tools(context)
+            return await self.think_with_tools(context, thinking_enabled=thinking_enabled, model=model, max_tool_turns=max_tool_turns or settings.proposer_max_tool_turns, timeout_seconds=timeout_seconds or settings.proposer_timeout)
         return await self.think_with_retry(context)
 
     async def propose(
@@ -79,13 +85,26 @@ class Proposer(BaseAgent):
                 "execution_result": {},
             }
 
-        if previous_attempts:
-            try:
-                critique = await self._self_critique(result, previous_attempts, domain)
-                if critique:
-                    result["_self_critique"] = critique
-            except Exception as e:
-                self.log.info("self_critique_skipped", error=str(e))
+        try:
+            if self._debug_callback:
+                await self._debug_callback("proposer", "self_critique_start",
+                    "Running self-critique checklist (stoichiometry, yield, thermo, workup, equipment, precursors, math, sensitivity)")
+            critique = await self._self_critique(result, previous_attempts, domain)
+            if critique:
+                result["_self_critique"] = critique
+                if self._debug_callback:
+                    issues = critique.get("issues_found", [])
+                    for issue in issues[:8]:
+                        await self._debug_callback("proposer", "critique_item",
+                            f"Self-critique found: {issue}", verbosity=VERBOSITY_MED)
+                    if not issues:
+                        await self._debug_callback("proposer", "critique_clean",
+                            "Self-critique: no issues found", verbosity=VERBOSITY_MED)
+                    adj = critique.get("confidence_adjustment", 0)
+                    await self._debug_callback("proposer", "self_critique_done",
+                        f"Found {len(issues)} issues, confidence adjustment {adj:+}")
+        except Exception as e:
+            self.log.info("self_critique_skipped", error=str(e))
 
         if "python_script" in result and result["python_script"]:
             code = result["python_script"]
@@ -100,6 +119,18 @@ class Proposer(BaseAgent):
                     success=execution["success"],
                     returncode=execution["returncode"],
                 )
+                if self._debug_callback and result.get("python_script"):
+                    debug_code = result["python_script"]
+                    imports = [line.strip() for line in debug_code.split("\n") if line.strip().startswith("import ") or line.strip().startswith("from ")][:5]
+                    debug_exec = result.get("execution_result", {})
+                    await self._debug_callback("proposer", "script",
+                        f"Script: {len(debug_code)} chars, imports={imports}, "
+                        f"success={debug_exec.get('success', False)}, returncode={debug_exec.get('returncode', '?')}",
+                        verbosity=VERBOSITY_MED)
+                if self._debug_callback and not result.get("execution_result", {}).get("success", True):
+                    error = result.get("execution_result", {}).get("error", result.get("execution_result", {}).get("stderr", ""))
+                    await self._debug_callback("proposer", "script_error",
+                        f"Script failed: {str(error)[:300]}", verbosity=VERBOSITY_MED)
             except Exception as e:
                 result["execution_result"] = {"success": False, "error": str(e)}
                 self.log.error("script_execution_failed", error=str(e))
@@ -128,43 +159,98 @@ class Proposer(BaseAgent):
                     "suggestions": pa.get("suggestions", []),
                 })
 
-        if not prior_failures:
-            return None
-
         hyp = hypothesis.get("hypothesis", hypothesis)
         hype_json = json.dumps(hyp, indent=2, default=str)
+        failures_context = json.dumps(prior_failures, indent=2) if prior_failures else "None (first attempt)"
 
         critique_prompt = (
-            "You are an internal quality-control critic. Review this hypothesis "
-            "for basic errors BEFORE it is submitted to the Verifier.\n\n"
+            "Review the hypothesis below against the checklist in your system prompt. "
+            "Use tools to verify claims against real published data.\n\n"
             f"Domain: {domain}\n\n"
             "## Prior Failures to Avoid\n"
-            f"{json.dumps(prior_failures, indent=2)}\n\n"
-            "## Your Hypothesis to Review\n"
+            f"{failures_context}\n\n"
+            "## Hypothesis to Review\n"
             f"{hype_json}\n\n"
-            "## Review Checklist\n"
-            "1. Stoichiometry: do reagent moles/ratios and quantities balance?\n"
-            "2. Yield: is claimed yield in a realistic range for this reaction class?\n"
-            "3. Thermodynamics/feasibility: is the reaction energetically plausible?\n"
-            "4. Workup: can the product be isolated with basic mid-1900s equipment?\n"
-            "5. Equipment: does the procedure avoid modern equipment (rotovap, HPLC, etc)?\n"
-            "6. Math: are ALL calculations arithmetically correct?\n\n"
             "Return ONLY a JSON object:\n"
             '{"issues_found": ["issue 1", ...], "suggested_fix": "brief fix note", "confidence_adjustment": -0.1}\n'
             'If no issues found, return {"issues_found": [], "confidence_adjustment": 0}'
         )
 
-        old_tools = self.tools
-        old_executors = self.tool_executors
+        context = {
+            "directive": critique_prompt,
+            "domain": domain,
+            "previous_attempts": "[]",
+            "data_context": "",
+        }
+        old_system_prompt = self.system_prompt
+        self.system_prompt = SELF_CRITIQUE_SYSTEM_PROMPT
         try:
-            self.tools = []
-            self.tool_executors = {}
-            context = {"directive": critique_prompt, "domain": domain,
-                       "previous_attempts": "[]", "data_context": ""}
-            response = await self.think(context, max_tokens=1024)
-            return self.parse_json_block(response)
-        except Exception:
-            return None
+            response = await self._think_smart(context, thinking_enabled=False, model=self.sub_model, max_tool_turns=settings.self_critique_max_tool_turns, timeout_seconds=settings.self_critique_timeout)
         finally:
-            self.tools = old_tools
-            self.tool_executors = old_executors
+            self.system_prompt = old_system_prompt
+        return self.parse_json_block(response)
+
+    async def revise(
+        self,
+        original_result: dict,
+        verifier_suggestions: list[str],
+        domain: str,
+    ) -> dict:
+        hyp = original_result.get("hypothesis", original_result)
+        hyp_json = json.dumps(hyp, indent=2, default=str)
+        suggestions_json = json.dumps(verifier_suggestions, indent=2)
+
+        revision_prompt = (
+            "Fix ONLY the specific issues listed below. Keep everything else "
+            "the same — do not rewrite unrelated parts of the hypothesis.\n\n"
+            f"## Original Hypothesis\n{hyp_json}\n\n"
+            f"## Verifier Feedback — Fix These Exact Issues\n{suggestions_json}\n\n"
+            "Return the COMPLETE revised hypothesis in the original JSON format "
+            "(including domain, analysis_summary, hypothesis, python_script, "
+            "features_detected, data_quality fields). Update ONLY the parts "
+            "affected by the Verifier's feedback."
+        )
+
+        context = {
+            "directive": revision_prompt,
+            "domain": domain,
+            "previous_attempts": json.dumps([
+                {"suggestions": verifier_suggestions}
+            ]),
+            "data_context": "",
+        }
+
+        self.log.info("proposer_revising", suggestions_count=len(verifier_suggestions))
+        old_system_prompt = self.system_prompt
+        self.system_prompt = REVISE_SYSTEM_PROMPT
+        try:
+            response = await self._think_smart(context, thinking_enabled=False, model=self.sub_model, max_tool_turns=settings.revise_max_tool_turns, timeout_seconds=settings.revise_timeout)
+        finally:
+            self.system_prompt = old_system_prompt
+        result = self.parse_json_block(response)
+
+        if result.get("error"):
+            self.log.info("revision_parse_failed", error=result["error"])
+            if self._debug_callback:
+                await self._debug_callback("proposer", "revise_fail",
+                    f"Revision parse failed: {result['error']}", verbosity=VERBOSITY_MED)
+            return original_result
+
+        if self._debug_callback and "error" not in (result or {}):
+            await self._debug_callback("proposer", "revise_success",
+                "Revision accepted — returning corrected hypothesis", verbosity=VERBOSITY_MED)
+
+        if "python_script" in result and result["python_script"]:
+            code = result["python_script"]
+            if code.startswith("```python"):
+                code = self.extract_code_block(code)
+            try:
+                result["execution_result"] = await run_script(code)
+                self.log.info(
+                    "revision_script_executed",
+                    success=result["execution_result"]["success"],
+                )
+            except Exception as e:
+                result["execution_result"] = {"success": False, "error": str(e)}
+
+        return result

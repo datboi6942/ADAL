@@ -28,6 +28,10 @@ Search strategy: be specific — include compound names, reaction names, and con
 - **PIVOT CHECK**: If 3+ consecutive iterations were all PARTIAL or FAIL with the same error category (e.g., all yield overestimations, all missing workup, all stoichiometry errors), action MUST be PIVOT — do NOT issue another CONTINUE for the same failing approach. Diversify: suggest a fundamentally different reaction pathway, alternative reagents, or different conditions.
 - **CONVERGENCE CHECK**: If the Verifier has given PASS for the same hypothesis twice with no new fatal flaws, action MUST be CONVERGE — do not loop unnecessarily.
 - If no progress for 3 iterations → consider if the question is answerable with current data
+- If sandbox execution failed but hypothesis reasoning was sound → CONTINUE with a corrected-script directive, not a PIVOT
+- If sandbox output directly contradicts the hypothesis claim → PIVOT immediately — the numerical evidence disproves it
+- If proposer summary is vague (no specific quantities, conditions, or citations) → demand specificity in the directive
+- If sandbox stdout shows calculation errors or unexpected values → include specific corrections in the directive
 
 ## Output Format
 Respond with a JSON object:
@@ -65,6 +69,13 @@ Respond with a JSON object:
   * **Precursor Accessibility Assessment**: Which precursors are restricted or monitored? For each restricted precursor, provide a complete, practical synthesis procedure from accessible starting materials using basic mid-1900s equipment. If any precursor cannot be practicably synthesized with basic equipment, clearly state this as a limitation
 - If the question is fundamentally unanswerable with current data, say so honestly.
 - Log EVERY decision with clear reasoning for auditability.
+
+TOOL USAGE POLICY:
+- You have a LIMITED number of tool turns for planning. Use tools SPARINGLY.
+- Tools are for verifying specific, critical factual claims only — NOT for browsing or collecting general references.
+- For initial domain classification and directive issuance, use your built-in knowledge ONLY — do NOT use tools.
+- If tool calls repeatedly fail (HTTP errors, timeouts, dead URLs), STOP using tools immediately. Output your plan using existing knowledge.
+- Dead URLs or failed searches are NOT a reason to search for replacement sources. Proceed with what you have.
 """
 
 PLANNER_USER_TEMPLATE = """## Relevant Session Memory
@@ -78,6 +89,18 @@ PLANNER_USER_TEMPLATE = """## Relevant Session Memory
 
 ## Latest Verifier Verdict
 {verdict_json}
+
+## Proposer's Analysis Summary
+{proposer_summary}
+
+## Sandbox Execution
+Success: {sandbox_success}
+Output (first 1500 chars):
+{sandbox_stdout}
+
+## Session Progress
+Prior Failures: {prior_failures_count}
+Validated Results: {validated_count}
 
 ## All Prior Hypotheses and Results
 {hypotheses_history}

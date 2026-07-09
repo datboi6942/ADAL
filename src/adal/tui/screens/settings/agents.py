@@ -53,6 +53,13 @@ class AgentSettingsScreen(Screen):
                         yield Label("Seed (leave empty for random)")
                         val = getattr(settings, f"{agent}_seed", None)
                         yield Input(value=str(val) if val is not None else "", id=f"{agent}-seed")
+                        yield Label("[bold]Tool Limits[/bold]")
+                        yield Label("Max Tool Turns")
+                        yield Input(value=str(getattr(settings, f"{agent}_max_tool_turns")), placeholder="6", id=f"{agent}-turns")
+                        yield Label("  [dim]Max LLM tool-call turns for this agent[/dim]")
+                        yield Label("Timeout (seconds)")
+                        yield Input(value=str(getattr(settings, f"{agent}_timeout")), placeholder="120", id=f"{agent}-timeout")
+                        yield Label("  [dim]Max wall-clock time before forced answer[/dim]")
         with VerticalScroll(id="forced-answer"):
             yield Label("[bold]Fallback[/bold]")
             yield Label("Forced Answer Temperature (0.0–1.0)")
@@ -67,6 +74,7 @@ class AgentSettingsScreen(Screen):
             for suffix, key_base in [
                 ("temp", "temperature"), ("topp", "top_p"), ("topk", "top_k"),
                 ("freq", "frequency_penalty"), ("pres", "presence_penalty"), ("seed", "seed"),
+                ("turns", "max_tool_turns"), ("timeout", "timeout"),
             ]:
                 val = self.query_one(f"#{agent}-{suffix}", Input).value.strip()
                 if val:

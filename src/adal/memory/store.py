@@ -6,6 +6,7 @@ import structlog
 
 from adal.config import settings
 from adal.memory.embedder import get_embedding
+from adal.tui.widgets.debug_panel import VERBOSITY_HIGH, VERBOSITY_MED
 
 logger = structlog.get_logger(__name__)
 
@@ -28,6 +29,7 @@ class MemoryStore:
         self._connected = False
         self._failure_vectors: list[list[float]] = []
         self._failure_vectors_loaded = False
+        self._debug_callback = None
 
     @property
     def enabled(self) -> bool:
@@ -54,7 +56,7 @@ class MemoryStore:
             logger.error("memory_connect_failed", error=str(e))
             self._connected = False
 
-    def reset_for_session(self, session_id: str):
+    async def reset_for_session(self, session_id: str):
         self._failure_vectors = []
         self._failure_vectors_loaded = False
         try:
@@ -72,11 +74,20 @@ class MemoryStore:
                         self._failure_vectors.append(vec)
                 self._failure_vectors_loaded = True
                 logger.debug("failure_vectors_restored", count=len(results), session_id=session_id)
+                if self._debug_callback:
+                    await self._debug_callback("memory", "reset",
+                        f"Session {session_id[:8]}: loaded {len(self._failure_vectors)} failure vectors for chaff pruning", verbosity=VERBOSITY_MED)
             else:
                 self._failure_vectors_loaded = True
+                if self._debug_callback:
+                    await self._debug_callback("memory", "reset_skip",
+                        "No memory table — failure vectors empty", verbosity=VERBOSITY_HIGH)
         except Exception as e:
             logger.debug("failure_vectors_restore_skipped", error=str(e))
             self._failure_vectors_loaded = True
+            if self._debug_callback:
+                await self._debug_callback("memory", "reset_error",
+                    f"Failed to restore failure vectors: {e}", verbosity=VERBOSITY_MED)
 
     async def record_memory(
         self,
@@ -105,6 +116,9 @@ class MemoryStore:
             }]
             self._table.add(data)
             logger.debug("memory_recorded", session_id=session_id, agent_role=agent_role, memory_type=memory_type, text_preview=text[:100])
+            if self._debug_callback:
+                await self._debug_callback("memory", "record",
+                    f"Recorded {agent_role} {memory_type} iter {iteration_turn}: {text[:120]}", verbosity=VERBOSITY_MED)
         except Exception as e:
             logger.error("memory_record_failed", error=str(e), session_id=session_id)
 
@@ -127,11 +141,17 @@ class MemoryStore:
         iteration: int = 0,
     ):
         if not self.enabled or not text or not text.strip():
+            if not self.enabled:
+                if self._debug_callback:
+                    await self._debug_callback("memory", "record_skip", "Memory store disabled", verbosity=VERBOSITY_HIGH)
             return
         try:
             vector = await get_embedding(text)
             vector_f = [float(v) for v in vector]
             self._failure_vectors.append(vector_f)
+            if self._debug_callback:
+                await self._debug_callback("memory", "failure_record",
+                    f"Failure vector recorded: {text[:200]}", verbosity=VERBOSITY_MED)
             data = [{
                 "vector": vector_f,
                 "text": text,
@@ -173,6 +193,8 @@ class MemoryStore:
 
     async def query_session_memory(self, query_text: str, session_id: str, limit: int | None = None) -> list[str]:
         if not self.enabled:
+            if self._debug_callback:
+                await self._debug_callback("memory", "query_skip", "Memory store disabled", verbosity=VERBOSITY_HIGH)
             return []
         self._connect()
         if not self._connected:
@@ -192,6 +214,10 @@ class MemoryStore:
                 .limit(fetch_n)
                 .to_list()
             )
+
+            if self._debug_callback:
+                await self._debug_callback("memory", "query",
+                    f"LanceDB returned {len(results)} candidates for: {query_text[:150]}", verbosity=VERBOSITY_MED)
 
             await self._load_failure_vectors(session_id)
 
@@ -217,7 +243,25 @@ class MemoryStore:
             else:
                 texts = [r["text"] for r in results[:max_results]]
 
+            pruned_count = len(results) - len(texts)
+            if self._debug_callback and pruned_count > 0:
+                await self._debug_callback("memory", "prune",
+                    f"Chaff pruned {pruned_count} of {len(results)} candidates (threshold={prune_threshold})", verbosity=VERBOSITY_MED)
+                for r in results:
+                    r_vec = r.get("vector", [])
+                    max_sim = 0.0
+                    for fail_vec in self._failure_vectors:
+                        sim = self._cosine_similarity(r_vec, fail_vec)
+                        if sim > max_sim:
+                            max_sim = sim
+                    if max_sim >= prune_threshold:
+                        await self._debug_callback("memory", "prune_detail",
+                            f"Pruned: {r['text'][:100]} (max similarity={max_sim:.3f})", verbosity=VERBOSITY_HIGH)
+
             logger.debug("session_memory_queried", session_id=session_id, fetched=len(results), returned=len(texts), pruned=(len(results) - len(texts)) if self._failure_vectors else 0)
+            if self._debug_callback:
+                await self._debug_callback("memory", "query_result",
+                    f"Returning {len(texts)} memories (pruned {len(results)-len(texts)})", verbosity=VERBOSITY_MED)
             return texts
         except Exception as e:
             logger.error("session_memory_query_failed", error=str(e), session_id=session_id)
@@ -275,6 +319,9 @@ class MemoryStore:
                 "timestamp": time.time(),
             }]
             self._table.add(data)
+            if self._debug_callback:
+                await self._debug_callback("memory", "lesson",
+                    f"Post-mortem lesson recorded: {summary[:200]}", verbosity=VERBOSITY_MED)
             logger.info("global_lesson_recorded", session_id=session_id, status=final_status)
         except Exception as e:
             logger.error("global_lesson_record_failed", error=str(e), session_id=session_id)

@@ -18,6 +18,18 @@ class AdvancedSettingsScreen(Screen):
             yield Label("Sandbox Timeout (seconds)")
             yield Input(value=str(settings.sandbox_timeout), placeholder="120", id="sandbox-timeout")
             yield Label("  [dim]Script execution time limit[/dim]")
+            yield Label("Planner Initial Tool Turns")
+            yield Input(value=str(settings.planner_initial_tool_turns), placeholder="0", id="planner-init-turns")
+            yield Label("  [dim]Tool turns for initial domain classification (0 = no tools)[/dim]")
+            yield Label("Self-Critique Max Turns")
+            yield Input(value=str(settings.self_critique_max_tool_turns), placeholder="3", id="critique-turns")
+            yield Label("  [dim]Tool turns for proposer self-critique review[/dim]")
+            yield Label("Deep Verify Max Turns")
+            yield Input(value=str(settings.deep_verify_max_tool_turns), placeholder="3", id="deep-verify-turns")
+            yield Label("  [dim]Tool turns for deep verification pass[/dim]")
+            yield Label("Revise Max Turns")
+            yield Input(value=str(settings.revise_max_tool_turns), placeholder="3", id="revise-turns")
+            yield Label("  [dim]Tool turns for proposer revision pass[/dim]")
 
             yield Label("[bold]Memory Tuning[/bold]")
             yield Label("Memory Context Cap")
@@ -53,6 +65,10 @@ class AdvancedSettingsScreen(Screen):
         for field_id, key in [
             ("max-iter", "MAX_ITERATIONS"),
             ("sandbox-timeout", "SANDBOX_TIMEOUT"),
+            ("planner-init-turns", "PLANNER_INITIAL_TOOL_TURNS"),
+            ("critique-turns", "SELF_CRITIQUE_MAX_TOOL_TURNS"),
+            ("deep-verify-turns", "DEEP_VERIFY_MAX_TOOL_TURNS"),
+            ("revise-turns", "REVISE_MAX_TOOL_TURNS"),
             ("memory-context-cap", "MEMORY_ENRICH_CONTEXT_CAP"),
             ("memory-index-min", "MEMORY_INDEX_MIN_ROWS"),
             ("search-max-results", "SEARCH_MAX_RESULTS"),

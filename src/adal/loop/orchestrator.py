@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import uuid
@@ -28,6 +29,7 @@ from adal.db.models import (
 from adal.db.session import get_sessionmaker
 from adal.llm.client import _calculate_cost
 from adal.memory.store import MemoryStore
+from adal.tui.widgets.debug_panel import VERBOSITY_HIGH, VERBOSITY_LOW, VERBOSITY_MED
 
 logger = structlog.get_logger(__name__)
 
@@ -65,14 +67,19 @@ class LoopState:
 
 
 class Orchestrator:
-    def __init__(self, model: str | None = None):
-        self.proposer = Proposer(model=model)
-        self.verifier = Verifier(model=model)
-        self.planner = Planner(model=model)
+    def __init__(self, model: str | None = None, sub_model: str | None = None):
+        self.proposer = Proposer(model=model, sub_model=sub_model)
+        self.verifier = Verifier(model=model, sub_model=sub_model)
+        self.planner = Planner(model=model, sub_model=sub_model)
         self.model = model or settings.deepseek_model or settings.llm_model
         self._display: Callable | None = None
         self._verbose_display: Callable | None = None
+        self._debug: Callable | None = None
         self.memory_store = MemoryStore()
+        self.proposer._debug_callback = self._dispatch_debug
+        self.verifier._debug_callback = self._dispatch_debug
+        self.planner._debug_callback = self._dispatch_debug
+        self.memory_store._debug_callback = self._dispatch_debug
 
     def set_display_callback(self, callback: Callable):
         self._display = callback
@@ -80,17 +87,45 @@ class Orchestrator:
     def set_verbose_display(self, callback: Callable):
         self._verbose_display = callback
 
-    async def _display_step(self, name: str, status: str, detail: str = ""):
+    def set_debug_callback(self, callback: Callable):
+        self._debug = callback
+
+    async def _dispatch_debug(self, category: str, event: str, detail: str = "", verbosity: int = VERBOSITY_LOW):
+        try:
+            if self._debug:
+                await self._debug(category, event, detail, verbosity=verbosity)
+        except Exception:
+            pass
+
+    async def _run_with_heartbeat(self, agent_name: str, coro):
+        async def _beat():
+            start = time.time()
+            while True:
+                await asyncio.sleep(5)
+                elapsed = int(time.time() - start)
+                await self._dispatch_debug(agent_name, "heartbeat", f"Working... {elapsed}s")
+        beat_task = asyncio.create_task(_beat())
+        try:
+            result = await coro
+        finally:
+            beat_task.cancel()
+            try:
+                await beat_task
+            except asyncio.CancelledError:
+                pass
+        return result
+
+    async def _display_step(self, name: str, status: str, detail: str = "", verbosity: int = VERBOSITY_LOW):
         try:
             if self._display:
-                await self._display(name, status, detail)
+                await self._display(name, status, detail, verbosity=verbosity)
         except Exception:
             logger.warning("display_callback_failed", name=name, status=status)
 
-    async def _display_reasoning(self, name: str, reasoning: str | None):
+    async def _display_reasoning(self, name: str, reasoning: str | None, verbosity: int = VERBOSITY_LOW):
         if reasoning:
             if self._verbose_display:
-                await self._verbose_display(name, reasoning)
+                await self._verbose_display(name, reasoning, verbosity=verbosity)
 
     def _capture_usage(self, agent) -> dict:
         usage = agent.total_usage
@@ -108,6 +143,7 @@ class Orchestrator:
     async def run(self, query: str, **display_kwargs) -> dict:
         session_id = str(uuid.uuid4())
         logger.info("orchestrator_start", session_id=session_id, query=query)
+        await self._dispatch_debug("fsm", "start", f"Session {session_id[:8]} query: {query[:200]}")
 
         live_state = display_kwargs.get("_live_state")
         live_refresh = display_kwargs.get("_live_refresh")
@@ -125,11 +161,20 @@ class Orchestrator:
             live_state.reasoning_text = f"Classifying: {query[:500]}"
         await self._display_step("planner", "thinking", "Classifying domain...")
 
+        state = LoopState(session_id=session_id, query=query, domain=Domain.UNKNOWN)
+        await self._persist_session(state)
+
+        await self._wire_memory(session_id)
+
         try:
-            initial_plan = await self.planner.initial_plan(query)
+            initial_plan = await self._run_with_heartbeat("planner", self.planner.initial_plan(query))
         except Exception as e:
             logger.error("initial_plan_failed", error=str(e))
             await self._display_step("planner", "error", f"Initial plan failed: {e}")
+            state.status = SessionStatus.FAILED
+            await self._update_session(state)
+            await self._dispatch_debug("db", "session_update",
+                f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
             return self._build_error_result(session_id, query, str(e))
 
         domain = _safe_domain(initial_plan.get("domain_classification", "unknown"))
@@ -140,11 +185,20 @@ class Orchestrator:
                 live_state.reasoning_agent = "PLANNER"
                 live_state.reasoning_text = self.planner.last_reasoning
                 _refresh()
-        await self._display_reasoning("PLANNER", self.planner.last_reasoning)
+        await self._display_reasoning("PLANNER", self.planner.last_reasoning, verbosity=VERBOSITY_MED)
         initial_reasoning = self.planner.last_reasoning
         reasoning_tag = _reasoning_tag(self.planner.last_reasoning)
         await self._display_step("planner", "done",
             f"Domain: {domain.value.upper()}  {self._usage_summary(plan_usage)}{reasoning_tag}")
+        await self._dispatch_debug("fsm", "config",
+            f"Provider={settings.llm_provider} model={self.model} sub_model={settings.deepseek_sub_model or 'none'} "
+            f"max_iters={settings.max_iterations} tool_turns={settings.llm_max_tool_turns} "
+            f"sandbox_timeout={settings.sandbox_timeout}s memory_enabled={settings.memory_enabled}", verbosity=VERBOSITY_HIGH)
+        elapsed = time.time() - state.started_at
+        cost = _calculate_cost(plan_usage)["total_cost"]
+        await self._dispatch_debug("usage", "planner",
+            f"PLANNER call: {plan_usage.get('total_tokens', 0)} tokens, ${cost:.5f}, {elapsed:.0f}s elapsed",
+            verbosity=VERBOSITY_MED)
         if live_state:
             live_state.token_info = _token_bar(plan_usage)
 
@@ -156,10 +210,6 @@ class Orchestrator:
         state.total_usage = _merge_usage(state.total_usage, plan_usage)
         if initial_reasoning:
             state.reasoning_log.append({"agent": "PLANNER", "iteration": 0, "text": initial_reasoning})
-
-        self._wire_memory(session_id)
-
-        await self._persist_session(state)
 
         current_directive = initial_plan.get(
             "directive_to_proposer",
@@ -180,22 +230,24 @@ class Orchestrator:
 
         while state.iteration < settings.max_iterations:
             state.iteration += 1
+            revision_attempted = False
             if live_state:
                 live_state.iteration = state.iteration
                 _refresh()
             logger.info("iteration_start", iteration=state.iteration, session_id=session_id)
+            await self._dispatch_debug("fsm", "iteration", f"Iter {state.iteration}/{settings.max_iterations}  domain={state.domain.value}  failures={len(state.prior_failures)}  validated={len(state.validated_results)}")
 
             if live_state:
                 live_state.reasoning_agent = "PROPOSER"
                 live_state.reasoning_text = f"Directive: {current_directive[:500]}"
             await self._display_step("proposer", "thinking", "Generating hypothesis...")
             try:
-                proposal = await self.proposer.propose(
+                proposal = await self._run_with_heartbeat("proposer", self.proposer.propose(
                     directive=current_directive,
                     domain=state.domain.value,
                     previous_attempts=state.prior_failures,
                     data_context=state.data_context,
-                )
+                ))
             except Exception as e:
                 logger.error("proposer_failed", error=str(e))
                 await self._display_step("proposer", "error", str(e)[:80])
@@ -206,6 +258,8 @@ class Orchestrator:
                 })
                 current_directive = f"Previous proposer attempt failed with error: {e}. Try a different approach."
                 await self._update_session(state)
+                await self._dispatch_debug("db", "session_update",
+                    f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
                 continue
 
             prop_usage = self._capture_usage(self.proposer)
@@ -213,7 +267,7 @@ class Orchestrator:
                 live_state.reasoning_agent = "PROPOSER"
                 live_state.reasoning_text = self.proposer.last_reasoning
                 _refresh()
-            await self._display_reasoning("PROPOSER", self.proposer.last_reasoning)
+            await self._display_reasoning("PROPOSER", self.proposer.last_reasoning, verbosity=VERBOSITY_MED)
             if self.proposer.last_reasoning:
                 state.reasoning_log.append({"agent": "PROPOSER", "iteration": state.iteration, "text": self.proposer.last_reasoning})
             state.total_usage = _merge_usage(state.total_usage, prop_usage)
@@ -223,11 +277,39 @@ class Orchestrator:
             hypothesis_summary = hypothesis_statement[:150] or proposal.get("analysis_summary", "")[:150]
             display_detail = f"{hypothesis_summary}  {self._usage_summary(prop_usage)}"
             await self._display_step("proposer", "done", display_detail)
+            elapsed = time.time() - state.started_at
+            cost = _calculate_cost(prop_usage)["total_cost"]
+            await self._dispatch_debug("usage", "proposer",
+                f"PROPOSER call: {prop_usage.get('total_tokens', 0)} tokens, ${cost:.5f}, {elapsed:.0f}s elapsed",
+                verbosity=VERBOSITY_MED)
             if live_state:
                 live_state.token_info = _status_bar(state.total_usage, state.started_at)
                 _refresh()
 
             script_ok = proposal.get("execution_result", {}).get("success", False)
+            exe = proposal.get("execution_result", {})
+            stdout = (exe.get("stdout", "") or "")[:300]
+            sandbox_msg = f"ok={script_ok}" + (f" stdout: {stdout}" if stdout else "")
+            await self._dispatch_debug("sandbox", "result", sandbox_msg)
+
+            await self._dispatch_debug("proposer", "hypothesis",
+                f"Proposal: {hypothesis_statement[:400]}")
+            critique = proposal.get("_self_critique", {})
+            if critique.get("issues_found"):
+                await self._dispatch_debug("proposer", "self_critique",
+                    f"Issues: {', '.join(critique['issues_found'][:4])}", verbosity=VERBOSITY_MED)
+            if critique.get("confidence_adjustment", 0) != 0:
+                await self._dispatch_debug("proposer", "confidence_adj",
+                    f"Self-critique adjusted confidence by {critique['confidence_adjustment']}", verbosity=VERBOSITY_MED)
+            if critique.get("issues_found"):
+                for issue in critique["issues_found"][:8]:
+                    await self._dispatch_debug("proposer", "critique_item",
+                        f"Self-critique issue: {issue}", verbosity=VERBOSITY_MED)
+            script_code = proposal.get("python_script", "")
+            if script_code:
+                await self._dispatch_debug("sandbox", "script",
+                    f"Script length: {len(script_code)} chars — imports: { [line.strip() for line in script_code.split(chr(10)) if line.strip().startswith('import ') or line.strip().startswith('from ')][:5] }", verbosity=VERBOSITY_MED)
+
             logger.info(
                 "proposer_done",
                 iteration=state.iteration,
@@ -245,6 +327,7 @@ class Orchestrator:
                 memory_type="episodic",
                 iteration_turn=state.iteration,
             )
+            await self._dispatch_debug("memory", "record", f"Proposer episodic iter {state.iteration}: {hypothesis_statement[:200]}", verbosity=VERBOSITY_MED)
 
             hypothesis_data = {
                 "domain": proposal.get("domain", state.domain.value),
@@ -259,6 +342,8 @@ class Orchestrator:
             hypothesis_db = await self._persist_hypothesis(
                 state, hypothesis_data, AgentRole.PROPOSER, HypothesisStatus.PROPOSED
             )
+            await self._dispatch_debug("db", "hypothesis_persist",
+                f"Hypothesis #{hypothesis_db.id[:8]} status={HypothesisStatus.PROPOSED.value}", verbosity=VERBOSITY_HIGH)
             proposal["_reasoning"] = self.proposer.last_reasoning
             await self._persist_interaction(
                 state, proposal, AgentRole.PROPOSER,
@@ -276,12 +361,12 @@ class Orchestrator:
                 live_state.reasoning_text = f"Validating: {hypothesis_statement[:500]}"
             await self._display_step("verifier", "thinking", "Validating hypothesis...")
             try:
-                verdict = await self.verifier.verify(
+                verdict = await self._run_with_heartbeat("verifier", self.verifier.verify(
                     hypothesis=hyp,
                     analysis_context=analysis_context,
                     domain=state.domain.value,
                     prior_failures=state.prior_failures,
-                )
+                ))
             except Exception as e:
                 logger.error("verifier_failed", error=str(e))
                 await self._display_step("verifier", "error", str(e)[:80])
@@ -301,7 +386,7 @@ class Orchestrator:
                 live_state.reasoning_agent = "VERIFIER"
                 live_state.reasoning_text = self.verifier.last_reasoning
                 _refresh()
-            await self._display_reasoning("VERIFIER", self.verifier.last_reasoning)
+            await self._display_reasoning("VERIFIER", self.verifier.last_reasoning, verbosity=VERBOSITY_MED)
             if self.verifier.last_reasoning:
                 state.reasoning_log.append({"agent": "VERIFIER", "iteration": state.iteration, "text": self.verifier.last_reasoning})
             state.total_usage = _merge_usage(state.total_usage, verif_usage)
@@ -330,11 +415,45 @@ class Orchestrator:
             if proof_preview and proof_preview != "None":
                 verdict_display += f"\nProof: {proof_preview}"
             await self._display_step("verifier", "done", verdict_display)
+            elapsed = time.time() - state.started_at
+            cost = _calculate_cost(verif_usage)["total_cost"]
+            await self._dispatch_debug("usage", "verifier",
+                f"VERIFIER call: {verif_usage.get('total_tokens', 0)} tokens, ${cost:.5f}, {elapsed:.0f}s elapsed",
+                verbosity=VERBOSITY_MED)
             if live_state:
                 live_state.token_info = _status_bar(state.total_usage, state.started_at)
                 _refresh()
 
             fatal_count = len(verdict_data.get("fatal_flaws", []))
+            flaws_list = verdict_data.get("fatal_flaws", [])
+            if flaws_list:
+                await self._dispatch_debug("verifier", "fatal_flaws",
+                    f"{fatal_count} fatal: {', '.join(str(f)[:100] for f in flaws_list[:5])}")
+            checks = verdict_data.get("checks_performed", [])
+            for c in checks[:6]:
+                result = c.get("result", "?") if isinstance(c, dict) else "?"
+                name = c.get("check", c.get("check_name", c.get("name", "unknown"))) if isinstance(c, dict) else str(c)
+                note = (c.get("note", c.get("reasoning", c.get("message", ""))) if isinstance(c, dict) else "")
+                note_str = str(note)[:150] if note else ""
+                if result in ("FAIL", "WARNING", "PARTIAL"):
+                    await self._dispatch_debug("verifier", "check",
+                        f"{result}: {name}" + (f" — {note_str}" if note_str else ""), verbosity=VERBOSITY_MED)
+
+            await self._dispatch_debug("verifier", "domain_validator",
+                f"Domain '{state.domain.value}' validator loaded", verbosity=VERBOSITY_HIGH)
+            numerical = verdict.get("numerical_validation", {})
+            if numerical:
+                for key, val in numerical.items():
+                    if isinstance(val, dict):
+                        status = "FAIL" if val.get("valid") is False else "PASS"
+                        await self._dispatch_debug("verifier", "numerical_check",
+                            f"{status}: {key} — {str(val.get('message', ''))[:200]}", verbosity=VERBOSITY_MED)
+            if verdict.get("_deep_verified"):
+                first_conf = verdict.get("_first_confidence", 0)
+                new_conf = verdict.get("confidence", 0)
+                await self._dispatch_debug("verifier", "deep_diff",
+                    f"Deep pass: confidence {first_conf:.0%} → {new_conf:.0%}, verdict → {verdict.get('verdict')}", verbosity=VERBOSITY_HIGH)
+
             logger.info(
                 "verifier_done",
                 iteration=state.iteration,
@@ -347,6 +466,9 @@ class Orchestrator:
             )
 
             verdict_passed = verdict_data["verdict"] == "PASS"
+            await self._dispatch_debug("fsm", "verdict",
+                f"Verdict={verdict_data['verdict']} conf={verdict_data['confidence']:.0%} "
+                f"checks={checks_passed}/{total_checks} fatal={fatal_count}")
 
             await self._persist_validation(
                 hypothesis_db.id,
@@ -359,6 +481,9 @@ class Orchestrator:
                 state, verdict, AgentRole.VERIFIER,
                 InteractionDirection.VERIFIER_TO_PLANNER, hypothesis_db.id,
             )
+
+            await self._dispatch_debug("memory", "record",
+                f"Verifier episodic iter {state.iteration}: {verdict_data.get('mathematical_proof', '')[:120]}", verbosity=VERBOSITY_MED)
 
             await self.memory_store.record_memory(
                 text=f"Verifier iteration {state.iteration}: verdict={verdict_data['verdict']} confidence={verdict_data['confidence']:.0%} flaws={len(verdict_data.get('fatal_flaws', []))}",
@@ -377,6 +502,12 @@ class Orchestrator:
                 })
                 hypothesis_db.status = HypothesisStatus.REJECTED
                 logger.info("hypothesis_status", iteration=state.iteration, status="REJECTED", flaws=len(verdict_data["fatal_flaws"]))
+                await self._dispatch_debug("fsm", "rejected",
+                    f"Iter {state.iteration}: {len(verdict_data['fatal_flaws'])} fatal flaws — "
+                     + ", ".join(str(f)[:80] for f in verdict_data["fatal_flaws"][:3]))
+
+                await self._dispatch_debug("memory", "failure_record",
+                    f"Recording failure iter {state.iteration}: {state.prior_failures[-1].get('hypothesis_summary', '')[:200]}", verbosity=VERBOSITY_MED)
 
                 await self.memory_store.record_failure(
                     text=f"Rejected hypothesis {state.iteration}: {hypothesis_statement[:200]} | Flaws: {', '.join(verdict_data['fatal_flaws'][:3])}",
@@ -392,6 +523,8 @@ class Orchestrator:
                 })
                 hypothesis_db.status = HypothesisStatus.VERIFIED
                 logger.info("hypothesis_status", iteration=state.iteration, status="VERIFIED", confidence=verdict_data["confidence"])
+                await self._dispatch_debug("fsm", "verified",
+                    f"Iter {state.iteration}: PASS conf={verdict_data['confidence']:.0%}  total_validated={len(state.validated_results)}")
             else:
                 hypothesis_db.status = HypothesisStatus.VALIDATING
                 logger.info("hypothesis_status", iteration=state.iteration, status="VALIDATING")
@@ -414,28 +547,105 @@ class Orchestrator:
                 common = last_three_flaws[0] & last_three_flaws[1] & last_three_flaws[2]
                 if common:
                     logger.warning("consecutive_identical_flaws", common=list(common))
+                    await self._dispatch_debug("fsm", "forced_pivot",
+                        f"3+ consecutive failures share: {', '.join(common)[:200]}  — SKIPPING planner, forcing PIVOT")
                     state.data_context += f"\n\n[SYSTEM: 3+ consecutive failures share flaws: {', '.join(common)}. Force PIVOT.]"
                     if live_state:
                         live_state.reasoning_text = "⚠ 3+ consecutive identical failures detected — forcing diversification"
                     current_directive = f"PIVOT REQUIRED: The last 3 approaches failed with the same flaws: {', '.join(common)}. Propose a fundamentally different approach — do NOT refine the previous method."
                     continue
+                else:
+                    await self._dispatch_debug("fsm", "failure_diversity",
+                        f"{len(state.prior_failures)} consecutive failures but flaws are different — continuing normally", verbosity=VERBOSITY_HIGH)
+
+            if (not revision_attempted
+                    and verdict_data.get("verdict") == "PARTIAL"
+                    and verdict_data.get("suggestions")
+                    and not verdict_data.get("fatal_flaws")):
+                await self._dispatch_debug("fsm", "revision",
+                    f"PARTIAL verdict — attempting revision ({len(verdict_data['suggestions'])} suggestions)", verbosity=VERBOSITY_MED)
+                revision_attempted = True
+                logger.info("revision_attempt", iteration=state.iteration)
+                try:
+                    await self._display_step("proposer", "thinking", "Revising based on Verifier feedback...")
+                    revised = await self._run_with_heartbeat("proposer", self.proposer.revise(
+                        proposal, verdict_data["suggestions"], state.domain.value
+                    ))
+                    await self._dispatch_debug("fsm", "revision_proposer",
+                        f"Revision proposer returned — verifier suggestions: {len(verdict_data['suggestions'])} items", verbosity=VERBOSITY_HIGH)
+                    rev_usage = self._capture_usage(self.proposer)
+                    state.total_usage = _merge_usage(state.total_usage, rev_usage)
+
+                    revised_verdict = await self._run_with_heartbeat("verifier", self.verifier.verify(
+                        hypothesis=revised.get("hypothesis", {}),
+                        analysis_context=analysis_context,
+                        domain=state.domain.value,
+                        prior_failures=state.prior_failures,
+                    ))
+                    await self._dispatch_debug("fsm", "revision_verifier",
+                        f"Post-revision verdict: {revised_verdict.get('verdict')} conf={revised_verdict.get('confidence', 0):.0%}", verbosity=VERBOSITY_HIGH)
+                    rev_verif_usage = self._capture_usage(self.verifier)
+                    state.total_usage = _merge_usage(state.total_usage, rev_verif_usage)
+
+                    if revised_verdict.get("verdict") == "PASS":
+                        logger.info("revision_accepted", iteration=state.iteration)
+                        proposal = revised
+                        verdict = revised_verdict
+                        hyp = proposal.get("hypothesis", {})
+                        hypothesis_statement = hyp.get("statement", "") if isinstance(hyp, dict) else str(hyp)
+                        hypothesis_data = {
+                            "domain": proposal.get("domain", state.domain.value),
+                            "analysis_summary": proposal.get("analysis_summary", ""),
+                            "hypothesis": hyp,
+                            "features_detected": proposal.get("features_detected", []),
+                            "execution_result": proposal.get("execution_result", {}),
+                            "data_quality": proposal.get("data_quality", {}),
+                        }
+                        verdict_data = {
+                            "verdict": revised_verdict.get("verdict", "UNKNOWN"),
+                            "confidence": revised_verdict.get("confidence", 0.0),
+                            "checks_performed": revised_verdict.get("checks_performed", []),
+                            "mathematical_proof": revised_verdict.get("mathematical_proof", ""),
+                            "corrected_values": revised_verdict.get("corrected_values", {}),
+                            "fatal_flaws": revised_verdict.get("fatal_flaws", []),
+                            "suggestions": revised_verdict.get("suggestions", []),
+                            "numerical_validation": revised_verdict.get("numerical_validation", {}),
+                        }
+                        verif_usage = _merge_usage(verif_usage, rev_verif_usage)
+                        state.hypotheses[-1] = hypothesis_data
+                        hypothesis_db.content = hypothesis_data
+                        await self._display_step("proposer", "done", "Revision accepted — hypothesis now passes!")
+                        if live_state:
+                            live_state.token_info = _status_bar(state.total_usage, state.started_at)
+                            _refresh()
+                    else:
+                        logger.info("revision_rejected", iteration=state.iteration)
+                        await self._display_step("proposer", "done", "Revision did not resolve all issues")
+                except Exception as e:
+                    logger.info("revision_attempt_failed", error=str(e))
+                    await self._display_step("proposer", "error", f"Revision crashed: {e}")
 
             if live_state:
                 live_state.reasoning_agent = "PLANNER"
                 live_state.reasoning_text = f"Deciding next action for: {verdict_data['verdict']} ({verdict_data['confidence']:.0%})"
             await self._display_step("decision", "thinking", "Evaluating next action...")
             try:
-                planner_decision = await self.planner.plan(
+                planner_decision = await self._run_with_heartbeat("planner", self.planner.plan(
                     user_query=query,
                     state={
                         "session_id": state.session_id,
                         "iteration": state.iteration,
                         "domain": state.domain.value,
                         "status": state.status.value,
+                        "proposer_summary": proposal.get("analysis_summary", "")[:500],
+                        "sandbox_success": proposal.get("execution_result", {}).get("success", False),
+                        "sandbox_stdout": (proposal.get("execution_result", {}).get("stdout", "") or "")[:1500],
+                           "prior_failures_count": len(state.prior_failures),
+                        "validated_count": len(state.validated_results),
                     },
                     verdict=verdict_data,
                     hypotheses_history=state.hypotheses[-3:],
-                )
+                ))
             except Exception as e:
                 logger.error("planner_decision_failed", error=str(e))
                 await self._display_step("decision", "error", str(e)[:80])
@@ -450,7 +660,7 @@ class Orchestrator:
                 live_state.reasoning_agent = "PLANNER"
                 live_state.reasoning_text = self.planner.last_reasoning
                 _refresh()
-            await self._display_reasoning("PLANNER", self.planner.last_reasoning)
+            await self._display_reasoning("PLANNER", self.planner.last_reasoning, verbosity=VERBOSITY_MED)
             if self.planner.last_reasoning:
                 state.reasoning_log.append({"agent": "PLANNER", "iteration": state.iteration, "text": self.planner.last_reasoning})
             state.total_usage = _merge_usage(state.total_usage, dec_usage)
@@ -472,6 +682,9 @@ class Orchestrator:
 
             await self._update_hypothesis_db(hypothesis_db)
 
+            await self._dispatch_debug("memory", "record",
+                f"Planner episodic iter {state.iteration}: action={action.value} reason={reason[:150]}", verbosity=VERBOSITY_MED)
+
             await self.memory_store.record_memory(
                 text=f"Planner iteration {state.iteration}: action={action.value} reason={reason[:200]}",
                 session_id=session_id,
@@ -483,6 +696,21 @@ class Orchestrator:
             reasoning_tag = _reasoning_tag(self.planner.last_reasoning)
             action_display = f"-> {action.value.upper()}: {reason[:120]}  {self._usage_summary(dec_usage)}{reasoning_tag}"
             await self._display_step("decision", "done", action_display)
+            await self._dispatch_debug("fsm", "action",
+                f"Planner → {action.value.upper()}  reason: {reason[:200]}")
+            await self._dispatch_debug("planner", "directive",
+                f"Next directive: {directive[:400]}", verbosity=VERBOSITY_MED)
+            await self._dispatch_debug("planner", "state",
+                f"Iteration {state.iteration}: failures={len(state.prior_failures)} "
+                f"validated={len(state.validated_results)} hypotheses={len(state.hypotheses)} "
+                f"domain={state.domain.value}", verbosity=VERBOSITY_MED)
+            await self._dispatch_debug("planner", "action_detail",
+                f"Action={action.value} — {state.status.value}", verbosity=VERBOSITY_MED)
+            elapsed = time.time() - state.started_at
+            cost = _calculate_cost(dec_usage)["total_cost"]
+            await self._dispatch_debug("usage", "planner",
+                f"PLANNER call: {dec_usage.get('total_tokens', 0)} tokens, ${cost:.5f}, {elapsed:.0f}s elapsed",
+                verbosity=VERBOSITY_MED)
             if live_state:
                 live_state.token_info = _status_bar(state.total_usage, state.started_at)
                 _refresh()
@@ -515,11 +743,15 @@ class Orchestrator:
                 state.status = SessionStatus.CONVERGED
                 state.final_answer = _normalize_answer(planner_decision.get("final_answer", str(state.validated_results)))
                 await self._update_session(state)
+                await self._dispatch_debug("db", "session_update",
+                    f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
                 return await self._finalize(state)
 
             elif action == PlannerAction.FAIL:
                 state.status = SessionStatus.FAILED
                 await self._update_session(state)
+                await self._dispatch_debug("db", "session_update",
+                    f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
                 return await self._finalize(state)
 
             elif action == PlannerAction.PIVOT:
@@ -530,9 +762,13 @@ class Orchestrator:
                 current_directive = directive
 
             await self._update_session(state)
+            await self._dispatch_debug("db", "session_update",
+                f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
 
         state.status = SessionStatus.MAX_ITERATIONS
         await self._update_session(state)
+        await self._dispatch_debug("db", "session_update",
+            f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
         logger.warning("max_iterations_reached", max=settings.max_iterations)
         return await self._finalize(state)
 
@@ -598,7 +834,7 @@ class Orchestrator:
             return self._build_error_result("", query or "", "No restorable sessions found")
 
         self._wire_live_state(display_kwargs)
-        self._wire_memory(session_id)
+        await self._wire_memory(session_id)
 
         logger.info("restore_start", session_id=session_id, iteration=state.iteration, domain=state.domain.value)
         if query:
@@ -618,13 +854,16 @@ class Orchestrator:
             current_directive = state.data_context or f"Continue the investigation for: {state.query}"
             restore_verdict = state.validated_results[-1].get("verdict", {}) if state.validated_results else {}
             try:
-                planner_decision = await self.planner.plan(
+                planner_decision = await self._run_with_heartbeat("planner", self.planner.plan(
                     user_query=state.query,
                     state={"session_id": session_id, "iteration": state.iteration,
-                           "domain": state.domain.value, "status": state.status.value},
+                           "domain": state.domain.value, "status": state.status.value,
+                           "proposer_summary": "", "sandbox_success": False,
+                           "sandbox_stdout": "", "prior_failures_count": len(state.prior_failures),
+                           "validated_count": len(state.validated_results)},
                     verdict=restore_verdict or None,
                     hypotheses_history=state.hypotheses[-3:],
-                )
+                ))
             except Exception as e:
                 logger.error("restore_planner_failed", error=str(e))
                 return self._build_error_result(session_id, state.query, f"Planner failed on restore: {e}")
@@ -639,10 +878,14 @@ class Orchestrator:
                 state.status = SessionStatus.CONVERGED
                 state.final_answer = planner_decision.get("final_answer", "")
                 await self._update_session(state)
+                await self._dispatch_debug("db", "session_update",
+                    f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
                 return await self._finalize(state)
             elif action == PlannerAction.FAIL:
                 state.status = SessionStatus.FAILED
                 await self._update_session(state)
+                await self._dispatch_debug("db", "session_update",
+                    f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
                 return await self._finalize(state)
 
             current_directive = planner_decision.get("directive_to_proposer", current_directive)
@@ -696,7 +939,7 @@ class Orchestrator:
 
     async def _run_loop(self, session_id: str, state: LoopState, current_directive: str, display_kwargs: dict) -> dict:
         self._wire_live_state(display_kwargs)
-        self._wire_memory(session_id)
+        await self._wire_memory(session_id)
         live_state = display_kwargs.get("_live_state")
         live_refresh = display_kwargs.get("_live_refresh")
 
@@ -718,18 +961,20 @@ class Orchestrator:
                 live_state.reasoning_text = f"Directive: {current_directive[:500]}"
             await self._display_step("proposer", "thinking", "Generating hypothesis...")
             try:
-                proposal = await self.proposer.propose(
+                proposal = await self._run_with_heartbeat("proposer", self.proposer.propose(
                     directive=current_directive,
                     domain=state.domain.value,
                     previous_attempts=state.prior_failures,
                     data_context=state.data_context,
-                )
+                ))
             except Exception as e:
                 logger.error("proposer_failed", error=str(e))
                 await self._display_step("proposer", "error", str(e)[:80])
                 state.prior_failures.append({"iteration": state.iteration, "hypothesis_summary": f"Proposer crashed: {e}", "reason": f"Proposer error: {e}"})
                 current_directive = f"Previous proposer attempt failed with error: {e}. Try a different approach."
                 await self._update_session(state)
+                await self._dispatch_debug("db", "session_update",
+                    f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
                 continue
 
             prop_usage = self._capture_usage(self.proposer)
@@ -737,7 +982,7 @@ class Orchestrator:
                 live_state.reasoning_agent = "PROPOSER"
                 live_state.reasoning_text = self.proposer.last_reasoning
                 _refresh()
-            await self._display_reasoning("PROPOSER", self.proposer.last_reasoning)
+            await self._display_reasoning("PROPOSER", self.proposer.last_reasoning, verbosity=VERBOSITY_MED)
             if self.proposer.last_reasoning:
                 state.reasoning_log.append({"agent": "PROPOSER", "iteration": state.iteration, "text": self.proposer.last_reasoning})
             state.total_usage = _merge_usage(state.total_usage, prop_usage)
@@ -747,6 +992,9 @@ class Orchestrator:
             hypothesis_summary = hypothesis_statement[:150] or proposal.get("analysis_summary", "")[:150]
             display_detail = f"{hypothesis_summary}  {self._usage_summary(prop_usage)}"
             await self._display_step("proposer", "done", display_detail)
+
+            await self._dispatch_debug("memory", "record",
+                f"Proposer episodic iter {state.iteration}: {hypothesis_statement[:200]}", verbosity=VERBOSITY_MED)
 
             await self.memory_store.record_memory(
                 text=f"Proposer iteration {state.iteration}: {hypothesis_statement}",
@@ -782,7 +1030,7 @@ class Orchestrator:
                 live_state.reasoning_text = f"Validating: {hypothesis_statement[:500]}"
             await self._display_step("verifier", "thinking", "Validating hypothesis...")
             try:
-                verdict = await self.verifier.verify(hypothesis=hyp, analysis_context=analysis_context, domain=state.domain.value, prior_failures=state.prior_failures)
+                verdict = await self._run_with_heartbeat("verifier", self.verifier.verify(hypothesis=hyp, analysis_context=analysis_context, domain=state.domain.value, prior_failures=state.prior_failures))
             except Exception as e:
                 logger.error("verifier_failed", error=str(e))
                 verdict = {"verdict": "FAIL", "confidence": 0.0, "fatal_flaws": [f"Verifier crashed: {e}"], "checks_performed": [], "suggestions": []}
@@ -792,7 +1040,7 @@ class Orchestrator:
                 live_state.reasoning_agent = "VERIFIER"
                 live_state.reasoning_text = self.verifier.last_reasoning
                 _refresh()
-            await self._display_reasoning("VERIFIER", self.verifier.last_reasoning)
+            await self._display_reasoning("VERIFIER", self.verifier.last_reasoning, verbosity=VERBOSITY_MED)
             if self.verifier.last_reasoning:
                 state.reasoning_log.append({"agent": "VERIFIER", "iteration": state.iteration, "text": self.verifier.last_reasoning})
             state.total_usage = _merge_usage(state.total_usage, verif_usage)
@@ -812,6 +1060,11 @@ class Orchestrator:
             total_checks = len(verdict_data["checks_performed"])
             verdict_display = f"Verdict: {verdict_data['verdict']} ({verdict_data['confidence']:.0%})  Checks: {checks_passed}/{total_checks}  {self._usage_summary(verif_usage)}"
             await self._display_step("verifier", "done", verdict_display)
+            elapsed = time.time() - state.started_at
+            cost = _calculate_cost(verif_usage)["total_cost"]
+            await self._dispatch_debug("usage", "verifier",
+                f"VERIFIER call: {verif_usage.get('total_tokens', 0)} tokens, ${cost:.5f}, {elapsed:.0f}s elapsed",
+                verbosity=VERBOSITY_MED)
             if live_state:
                 live_state.token_info = _status_bar(state.total_usage, state.started_at)
                 _refresh()
@@ -819,6 +1072,9 @@ class Orchestrator:
             await self._persist_validation(hypothesis_db.id, verdict_data["verdict"] == "PASS", verdict_data["confidence"], verdict_data)
             verdict["_reasoning"] = self.verifier.last_reasoning
             await self._persist_interaction(state, verdict, AgentRole.VERIFIER, InteractionDirection.VERIFIER_TO_PLANNER, hypothesis_db.id)
+
+            await self._dispatch_debug("memory", "record",
+                f"Verifier episodic iter {state.iteration}: {verdict_data.get('mathematical_proof', '')[:120]}", verbosity=VERBOSITY_MED)
 
             await self.memory_store.record_memory(
                 text=f"Verifier iteration {state.iteration}: verdict={verdict_data['verdict']} confidence={verdict_data['confidence']:.0%} flaws={len(verdict_data.get('fatal_flaws', []))}",
@@ -831,6 +1087,9 @@ class Orchestrator:
             if verdict_data.get("fatal_flaws"):
                 state.prior_failures.append({"iteration": state.iteration, "hypothesis_summary": hypothesis_summary, "fatal_flaws": verdict_data["fatal_flaws"], "reason": "Fatal"})
                 hypothesis_db.status = HypothesisStatus.REJECTED
+
+                await self._dispatch_debug("memory", "failure_record",
+                    f"Recording failure iter {state.iteration}: {state.prior_failures[-1].get('hypothesis_summary', '')[:200]}", verbosity=VERBOSITY_MED)
 
                 await self.memory_store.record_failure(
                     text=f"Rejected hypothesis {state.iteration}: {hypothesis_summary[:200]} | Flaws: {', '.join(verdict_data['fatal_flaws'][:3])}",
@@ -859,7 +1118,7 @@ class Orchestrator:
                 live_state.reasoning_text = f"Deciding next action for: {verdict_data['verdict']} ({verdict_data['confidence']:.0%})"
             await self._display_step("decision", "thinking", "Evaluating next action...")
             try:
-                planner_decision = await self.planner.plan(user_query=state.query, state={"session_id": session_id, "iteration": state.iteration, "domain": state.domain.value, "status": state.status.value}, verdict=verdict_data, hypotheses_history=state.hypotheses[-3:])
+                planner_decision = await self._run_with_heartbeat("planner", self.planner.plan(user_query=state.query, state={"session_id": session_id, "iteration": state.iteration, "domain": state.domain.value, "status": state.status.value, "proposer_summary": proposal.get("analysis_summary", "")[:500], "sandbox_success": proposal.get("execution_result", {}).get("success", False), "sandbox_stdout": (proposal.get("execution_result", {}).get("stdout", "") or "")[:1500], "prior_failures_count": len(state.prior_failures), "validated_count": len(state.validated_results)}, verdict=verdict_data, hypotheses_history=state.hypotheses[-3:]))
             except Exception as e:
                 logger.error("planner_decision_failed", error=str(e))
                 planner_decision = {"action": "fail", "directive_to_proposer": current_directive, "reasoning": f"Planner crashed: {e}"}
@@ -869,7 +1128,7 @@ class Orchestrator:
                 live_state.reasoning_agent = "PLANNER"
                 live_state.reasoning_text = self.planner.last_reasoning
                 _refresh()
-            await self._display_reasoning("PLANNER", self.planner.last_reasoning)
+            await self._display_reasoning("PLANNER", self.planner.last_reasoning, verbosity=VERBOSITY_MED)
             if self.planner.last_reasoning:
                 state.reasoning_log.append({"agent": "PLANNER", "iteration": state.iteration, "text": self.planner.last_reasoning})
             state.total_usage = _merge_usage(state.total_usage, dec_usage)
@@ -889,6 +1148,9 @@ class Orchestrator:
 
             await self._update_hypothesis_db(hypothesis_db)
 
+            await self._dispatch_debug("memory", "record",
+                f"Planner episodic iter {state.iteration}: action={action.value} reason={reason[:150]}", verbosity=VERBOSITY_MED)
+
             await self.memory_store.record_memory(
                 text=f"Planner iteration {state.iteration}: action={action.value} reason={reason[:200]}",
                 session_id=session_id,
@@ -900,6 +1162,10 @@ class Orchestrator:
             reasoning_tag = _reasoning_tag(self.planner.last_reasoning)
             action_display = f"-> {action.value.upper()}: {reason[:120]}  {self._usage_summary(dec_usage)}{reasoning_tag}"
             await self._display_step("decision", "done", action_display)
+            await self._dispatch_debug("fsm", "action",
+                f"Planner → {action.value.upper()}  reason: {reason[:200]}")
+            await self._dispatch_debug("planner", "directive",
+                f"Next directive: {directive[:400]}", verbosity=VERBOSITY_MED)
             if live_state:
                 live_state.token_info = _status_bar(state.total_usage, state.started_at)
                 _refresh()
@@ -912,10 +1178,14 @@ class Orchestrator:
                 state.status = SessionStatus.CONVERGED
                 state.final_answer = _normalize_answer(planner_decision.get("final_answer", ""))
                 await self._update_session(state)
+                await self._dispatch_debug("db", "session_update",
+                    f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
                 return await self._finalize(state)
             elif action == PlannerAction.FAIL:
                 state.status = SessionStatus.FAILED
                 await self._update_session(state)
+                await self._dispatch_debug("db", "session_update",
+                    f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
                 return await self._finalize(state)
             elif action == PlannerAction.PIVOT:
                 current_directive = directive
@@ -923,19 +1193,22 @@ class Orchestrator:
                 current_directive = directive
 
             await self._update_session(state)
+            await self._dispatch_debug("db", "session_update",
+                f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
 
         state.status = SessionStatus.MAX_ITERATIONS
         await self._update_session(state)
+        await self._dispatch_debug("db", "session_update",
+            f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
         return await self._finalize(state)
 
-    def _wire_memory(self, session_id: str):
-        self.memory_store.reset_for_session(session_id)
-        self.planner.memory_store = self.memory_store
-        self.planner.current_session_id = session_id
-        self.proposer.memory_store = self.memory_store
-        self.proposer.current_session_id = session_id
-        self.verifier.memory_store = self.memory_store
-        self.verifier.current_session_id = session_id
+    async def _wire_memory(self, session_id: str):
+        await self.memory_store.reset_for_session(session_id)
+        shared_cache: dict[str, str] = {}
+        for agent in (self.planner, self.proposer, self.verifier):
+            agent.memory_store = self.memory_store
+            agent.current_session_id = session_id
+            agent._search_cache = shared_cache
 
     def _wire_live_state(self, display_kwargs: dict):
         live_state = display_kwargs.get("_live_state")
@@ -990,6 +1263,7 @@ class Orchestrator:
             existing = await db.get(Hypothesis, hyp.id)
             if existing:
                 existing.status = hyp.status
+                existing.content = hyp.content
                 await db.commit()
 
     async def _persist_interaction(

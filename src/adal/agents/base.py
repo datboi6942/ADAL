@@ -6,6 +6,7 @@ import structlog
 
 from adal.config import settings
 from adal.llm.client import LLMResponse, chat_completion, chat_completion_with_tools
+from adal.tools.web_search import async_fetch_url, async_search_web
 
 logger = structlog.get_logger(__name__)
 
@@ -60,17 +61,20 @@ class BaseAgent(ABC):
     role: str
     system_prompt: str
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, sub_model: str | None = None):
         self.model = model
+        self.sub_model = sub_model
         self.log = logger.bind(role=self.role)
         self.total_usage: dict = _empty_usage()
         self.last_reasoning: str | None = None
         self.tools: list[dict] = []
         self.tool_executors: dict = {}
+        self._search_cache: dict | None = None
         self.current_session_id: str | None = None
         self.current_iteration: int = 0
         self._memory = None
         self.gen_params: dict = {}
+        self._debug_callback = None
 
     @property
     def memory_store(self):
@@ -82,6 +86,10 @@ class BaseAgent(ABC):
 
     async def _enrich_context(self, context: dict) -> dict:
         if self._memory is None or self.current_session_id is None:
+            if self._debug_callback:
+                await self._debug_callback("memory", "context_skip",
+                    f"No memory injection: store={self._memory is not None} session={self.current_session_id}",
+                    verbosity=2)
             return context
 
         try:
@@ -90,6 +98,9 @@ class BaseAgent(ABC):
                 query_text = context["hypothesis_json"]
 
             if query_text:
+                if self._debug_callback:
+                    await self._debug_callback("memory", "query",
+                        f"Searching memory for: {str(query_text)[:200]}", verbosity=1)
                 memories = await self._memory.query_session_memory(
                     query_text=str(query_text)[:2000],
                     session_id=self.current_session_id,
@@ -98,9 +109,22 @@ class BaseAgent(ABC):
                 if memories:
                     summary = "\n".join(f"- {m[:200].strip()}" for m in memories)
                     context["_session_memory"] = summary
+                    if self._debug_callback:
+                        await self._debug_callback("memory", "found",
+                            f"Found {len(memories)} memories — injecting into prompt", verbosity=1)
+                        for m in memories:
+                            await self._debug_callback("memory", "detail",
+                                f"Memory: {m[:200]}", verbosity=2)
                     self.log.debug("context_enriched", memories=len(memories))
+            else:
+                if self._debug_callback:
+                    await self._debug_callback("memory", "context_skip",
+                        "No queryable text in context", verbosity=2)
         except Exception as e:
             self.log.debug("context_enrich_skipped", error=str(e))
+            if self._debug_callback:
+                await self._debug_callback("memory", "error",
+                    f"Memory enrichment failed: {e}", verbosity=1)
 
         return context
 
@@ -111,16 +135,18 @@ class BaseAgent(ABC):
     def build_prompt(self, context: dict) -> str:
         ...
 
-    async def think(self, context: dict, max_tokens: int | None = None) -> str:
+    async def think(self, context: dict, max_tokens: int | None = None, thinking_enabled: bool = True, model: str | None = None) -> str:
         context = await self._enrich_context(context)
         prompt = self.build_prompt(context)
         self.log.debug("agent_thinking", prompt_length=len(prompt))
         response: LLMResponse = await chat_completion(
             system_prompt=self.system_prompt,
             user_message=prompt,
-            model=self.model,
+            model=model or self.model,
             max_tokens=max_tokens or settings.llm_max_tokens,
             gen_params=self.gen_params,
+            thinking_enabled=thinking_enabled,
+            debug_callback=self._debug_callback,
         )
         self.total_usage = _merge_usage(self.total_usage, response.usage)
         self.last_reasoning = response.reasoning
@@ -132,9 +158,11 @@ class BaseAgent(ABC):
             retry_response: LLMResponse = await chat_completion(
                 system_prompt=self.system_prompt,
                 user_message=self.build_prompt(context),
-                model=self.model,
+                model=model or self.model,
                 max_tokens=max_tokens or settings.llm_max_tokens,
                 gen_params=self.gen_params,
+                thinking_enabled=thinking_enabled,
+                debug_callback=self._debug_callback,
             )
             self.total_usage = _merge_usage(self.total_usage, retry_response.usage)
             if retry_response.reasoning:
@@ -165,19 +193,37 @@ class BaseAgent(ABC):
                 )
         return response
 
-    async def think_with_tools(self, context: dict, max_tokens: int | None = None, max_tool_turns: int = 6) -> str:
+    async def think_with_tools(self, context: dict, max_tokens: int | None = None, max_tool_turns: int = settings.llm_max_tool_turns, thinking_enabled: bool = True, model: str | None = None, use_tools: bool = True, timeout_seconds: float | None = None) -> str:
         context = await self._enrich_context(context)
         prompt = self.build_prompt(context)
         self.log.debug("agent_thinking_tools", prompt_length=len(prompt), tools=len(self.tools))
+
+        effective_tools = self.tools if use_tools else []
+
+        executors = dict(self.tool_executors)
+        if self._search_cache is not None:
+            cache = self._search_cache
+
+            async def _cached_search(query, max_results=None):
+                return await async_search_web(query, max_results, _cache=cache)
+            executors["web_search"] = _cached_search
+
+            async def _cached_fetch(url, max_chars=None):
+                return await async_fetch_url(url, max_chars, _cache=cache)
+            executors["fetch_url"] = _cached_fetch
+
         response: LLMResponse = await chat_completion_with_tools(
             system_prompt=self.system_prompt,
             user_message=prompt,
-            tools=self.tools,
-            tool_executors=self.tool_executors,
-            model=self.model,
+            tools=effective_tools,
+            tool_executors=executors,
+            model=model or self.model,
             max_tokens=max_tokens or settings.llm_max_tokens,
             max_tool_turns=max_tool_turns,
             gen_params=self.gen_params,
+            thinking_enabled=thinking_enabled,
+            debug_callback=self._debug_callback,
+            timeout_seconds=timeout_seconds,
         )
         self.total_usage = _merge_usage(self.total_usage, response.usage)
         self.last_reasoning = response.reasoning
@@ -189,9 +235,11 @@ class BaseAgent(ABC):
             retry_response: LLMResponse = await chat_completion(
                 system_prompt=self.system_prompt,
                 user_message=self.build_prompt(context),
-                model=self.model,
+                model=model or self.model,
                 max_tokens=max_tokens or settings.llm_max_tokens,
                 gen_params=self.gen_params,
+                thinking_enabled=thinking_enabled,
+                debug_callback=self._debug_callback,
             )
             self.total_usage = _merge_usage(self.total_usage, retry_response.usage)
             if retry_response.reasoning:
