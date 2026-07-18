@@ -124,6 +124,9 @@ class WelcomeScreen(Screen):
         yield Footer()
 
     def on_mount(self):
+        self.call_after_refresh(self._on_first_layout)
+
+    def _on_first_layout(self):
         self.query_one("#btn-new-session", Button).focus()
         self._animate_entrance()
         self._start_border_glow()
@@ -133,6 +136,7 @@ class WelcomeScreen(Screen):
         self.set_timer(0.3, lambda: self.query_one("#welcome-subtitle").add_class("visible"))
         self.set_timer(0.5, lambda: self.query_one("#welcome-buttons").add_class("visible"))
         self.set_timer(0.7, lambda: self.query_one("#welcome-footer").add_class("visible"))
+        self.set_timer(0.8, lambda: self.query_one("#welcome-buttons").refresh(layout=True))
 
     def _start_border_glow(self):
         self._glow_phase = 0
