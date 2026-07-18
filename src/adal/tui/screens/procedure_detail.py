@@ -1,3 +1,5 @@
+import asyncio
+
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.screen import Screen
@@ -164,6 +166,9 @@ class ProcedureDetailScreen(Screen):
             self._export()
 
     def _export(self):
+        asyncio.create_task(self._do_export())
+
+    async def _do_export(self):
         try:
             content = self._hypothesis.content or {}
             hyp = content.get("hypothesis", {})
@@ -175,8 +180,17 @@ class ProcedureDetailScreen(Screen):
             if hyp.get("workup_procedure"):
                 text += f"## Workup\n{hyp.get('workup_procedure', '')}\n\n"
             text += f"## Analysis\n{content.get('analysis_summary', '')}\n\n"
+
             from pathlib import Path
-            path = Path("adal_procedure_export.md")
+
+            from adal.tui.utils import generate_export_filename
+
+            content_preview = hyp.get("synthesis_procedure", "") or hyp.get("statement", "")
+            filename = await generate_export_filename(
+                self._session.query or hyp.get("statement", ""),
+                content_preview,
+            )
+            path = Path(f"{filename}.md")
             path.write_text(text)
             self.notify(f"Exported to {path}", title="Export")
         except Exception as e:
