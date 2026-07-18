@@ -12,7 +12,7 @@ cp .env.example .env       # requires DEEPSEEK_API_KEY
 
 ```bash
 uv run ruff check src/ tests/ --ignore E501,N806   # lint
-uv run pytest tests/ -q                              # 47 tests, asyncio auto mode
+uv run pytest tests/ -q                              # 81 tests, asyncio auto mode
 ```
 
 No typecheck, no pre-commit hooks in CI. `ruff` with `--ignore E501,N806` is the only gate.
@@ -43,7 +43,18 @@ Settings > Model & Provider (Sub-Agent Models section). `_provider_kwargs()` in
 ### FSM Override: Consecutive Failure Detection
 When 3+ consecutive failures share identical fatal flaws, the orchestrator forces a PIVOT
 directive — skipping the planner entirely. Orchestrator code in
-`loop/orchestrator.py` at the consecutive-failure check (~line 409-421).
+`loop/orchestrator.py` at the consecutive-failure check (~line 548-565).
+
+Additionally, two loop-level streak counters protect against unproductive loops:
+- **Proposer crash streak** (`proposer_crash_streak`): initialized BEFORE the `while` loop,
+  persists across iterations. Incremented on each proposer crash; reset on successful propose.
+  3 consecutive crashes → `SessionStatus.FAILED` + `_finalize()`.
+- **Invalid action streak** (`invalid_action_streak`): same pattern for PlannerAction parse
+  failures. 3 consecutive invalid action strings → forced `FAIL` action.
+- Proposer crash entries now include `"fatal_flaws": [f"Proposer crashed: {type(e).__name__}"]`
+  so they participate in the existing intersection-based PIVOT detection.
+- Planner crash is retried once before failing — prevents a transient network error from
+  killing the entire multi-iteration session.
 
 ### JSON Parsing Quirks
 Always use `parse_json_block(response)` from `agents/base.py`. It implements 7-stage extraction:
@@ -61,7 +72,10 @@ consecutive tool failures: strips tool messages, **disables thinking mode** (no
 `reasoning_effort`, no `extra_body`), sends hard prompt. Now includes failure context:
 *"You attempted N tool calls over T turns with F failures (HTTP errors, timeouts, dead URLs)."*
 
-`response_format={"type":"json_object"}` is **incompatible with DeepSeek** — removed.
+`response_format={"type":"json_object"}` is **supported by DeepSeek V4 PRO** (see
+[api-docs.deepseek.com/guides/json_mode](https://api-docs.deepseek.com/guides/json_mode)).
+May occasionally return empty content (known DeepSeek issue, being fixed).
+Do NOT use with legacy models (`deepseek-chat`, `deepseek-reasoner` — to be deprecated 2026/07/24).
 
 ### Async Tools
 `TOOL_EXECUTORS` maps directly to async functions (`async_search_web`, `async_fetch_url`).
@@ -105,6 +119,10 @@ It uses `_think_smart()` with full tool access (web_search, fetch_url, calculate
 role confusion where the model thinks it's still generating hypotheses. Expanded checklist:
 stoichiometry, yield, thermodynamics, workup, equipment, precursors, math, moisture/air
 sensitivity. Runs as a sub-model call (`deepseek-v4-chat`, no thinking).
+
+Results (`confidence_adjustment`, `suggested_fix`, `issues_found`) are automatically applied
+to the hypothesis before sandbox execution — confidence is clamped to [0.0, 1.0], suggested
+fixes are injected into `analysis_summary`, and found issues are appended to hypothesis notes.
 
 ### Two-Phase Verifier
 After the main LLM validation pass, `Verifier._should_deep_verify()` gates a second, focused
@@ -203,18 +221,34 @@ Every agent system prompt now includes a hardened TOOL USAGE POLICY section:
   (0.85) drops episodic results from queries. Prevents cognitive death spirals.
 - **Index**: Only created when `row_count >= 256`. `create_index(num_partitions=...)` fails
   on small tables — wrapped in try/except, logs warning, connection proceeds.
-- **Context cap**: `_enrich_context` limits to 3 memories max. Planner receives last 3
+- **Context cap**: `_enrich_context` limits memories via `min(memory_max_episodic, memory_enrich_context_cap)`
+  (configurable, was previously hardcoded to 3). Planner receives last 3
   hypotheses only (`state.hypotheses[-3:]`). Prevents prompt bloat.
+- **Enrichment caching**: `_enrich_context` caches results by `(session_id, directive_hash)`
+  to avoid redundant embedding API calls and LanceDB queries on parse-failure retries
+  and repeated calls within an iteration.
 - **Global lessons**: Post-mortem hook at session end. Queried at session start.
 
 ## Search & Tools
 
 - **DDG → Wikipedia fallback**: 3 retries with exponential backoff, then Wikipedia opensearch.
-  Inter-request throttling: 2s base delay, doubles after rate-limit hit. In-session query
-  cache prevents duplicate API calls.
+  Inter-request throttling: 2s base delay, doubles after rate-limit hit. Throttle timer set
+  **after** HTTP response (not before) to prevent latency from consuming the throttle window.
+  Retry backoff driven by `settings.search_max_retries` / `settings.fetch_max_retries`. In-session
+  query cache prevents duplicate API calls.
 - **Shared session cache**: `async_search_web` and `async_fetch_url` both accept optional
   `_cache` dict. Orchestrator injects a session-scoped cache into all agents. Eliminates
   redundant cross-agent searches and fetches.
+- **Wikipedia fallback results cached**: Stored at the same DDG cache key to prevent repeated
+  Wikipedia API calls on persistent DDG failure.
+- **Empty DDG results not cached**: Ensures Wikipedia fallback remains reachable on subsequent
+  retries instead of permanently returning empty results.
+- **fetch_url module-level cache**: `_fetch_cache` global dict mirrors `_query_cache` pattern.
+  Standalone `fetch_url` calls get caching even outside the orchestrator's session cache.
+- **HTTP error responses cached**: 404/403/500 results cached (session-scoped) to prevent
+  redundant fetches of dead URLs within a session.
+- **Bounded caches**: `_query_cache` and `_fetch_cache` are `OrderedDict`s with LRU eviction
+  at 500 entries max via `_cache_put()` helper.
 - **Parallel execution**: `asyncio.gather` runs multiple tool calls concurrently. DDG requests
   are serialized via `_search_lock`; `fetch_url` and `calculate` are fully parallel.
 - **PubChem**: Blocked at fetch level. `async_fetch_url` returns instant error without
@@ -248,6 +282,17 @@ Every agent system prompt now includes a hardened TOOL USAGE POLICY section:
 - `tool_fail_streak_limit=3` — consecutive failures before forced answer.
 - Sub-model defaults: `deepseek_sub_model="deepseek-v4-chat"` (cheap, no thinking),
   `openai_sub_model="gpt-4o-mini"`, with per-provider overrides.
+- Config fields `search_max_retries`, `fetch_max_retries`, and `memory_query_oversample_factor`
+  use `Field(ge=, le=)` validators to prevent silent breakage from out-of-range values.
+- `memory_query_oversample_factor` controls LanceDB query oversampling (was hardcoded `* 3`).
+- `memory_enrich_context_cap` controls how many memories are injected into prompts
+  (was hardcoded to 3).
+
+### Circular Import Breaker
+`llm/client.py` imports verbosity constants from `adal.constants` (NOT
+`tui.widgets.debug_panel`), breaking the `base.py → client.py → tui → orch → base.py`
+import cycle. `_empty_usage()` and `_merge_usage()` are defined directly in
+`loop/orchestrator.py` (not imported from `agents.base`) for the same reason.
 
 ## TUI Architecture
 
@@ -268,7 +313,10 @@ widget — NOT `Input`. Key behaviors:
   Border glow animation pulsing through cyan/magenta/green/blue.
 - **IterationCard**: Confetti burst (6-frame Unicode chars) on PASS verdict. Shake effect
   (x-offset oscillation) on FAIL/error. Fade-in mounting via opacity transition.
-- **Status bar**: CSS class transitions (idle/running/done/error-state) change background color.
+- **Status bar**: Status bar animation extracted to `StatusAnimatableMixin` in
+  `widgets/status_animatable.py` — shared between `dashboard.py` and `session_detail.py`.
+  Supports `_status_label_fallback` and `_on_status_animation_started` hooks for subclass
+  customization. CSS class transitions (idle/running/done/error-state) change background color.
   Iteration progress bar using Unicode block characters (█░░░ → ████).
 
 ### Verbose Mode
