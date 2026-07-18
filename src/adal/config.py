@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -90,7 +90,7 @@ class Settings(BaseSettings):
     forced_answer_temperature: float = 0.1
 
     search_throttle_delay: float = 2.0
-    search_max_retries: int = 3
+    search_max_retries: int = Field(3, ge=1, le=30)
     blocked_fetch_hosts: str = "pubchem.ncbi.nlm.nih.gov"
 
     search_max_results: int = 5
@@ -98,7 +98,7 @@ class Settings(BaseSettings):
     search_backoff_base: float = 2.0
 
     fetch_max_chars: int = 10000
-    fetch_max_retries: int = 3
+    fetch_max_retries: int = Field(3, ge=1, le=30)
     fetch_timeout: float = 25.0
 
     llm_max_tool_turns: int = 12
@@ -116,7 +116,7 @@ class Settings(BaseSettings):
     planner_timeout: float = 60.0
     proposer_timeout: float = 120.0
     verifier_timeout: float = 90.0
-    self_critique_timeout: float = 30.0
+    self_critique_timeout: float = 60.0
     deep_verify_timeout: float = 45.0
     revise_timeout: float = 45.0
 
@@ -125,9 +125,13 @@ class Settings(BaseSettings):
 
     memory_enrich_context_cap: int = 3
     memory_index_min_rows: int = 256
-    memory_query_oversample_factor: int = 3
+    memory_query_oversample_factor: int = Field(3, ge=1, le=20)
 
     adal_theme: str = "textual-dark"
+
+    telemetry_enabled: bool = False
+    telemetry_model: str = "deepseek-v4-pro"
+    telemetry_interval: int = 1
 
     @property
     def db_path(self) -> Path:

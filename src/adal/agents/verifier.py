@@ -6,6 +6,7 @@ import structlog
 
 from adal.agents.base import BaseAgent
 from adal.config import settings
+from adal.constants import VERBOSITY_HIGH, VERBOSITY_LOW, VERBOSITY_MED  # noqa: F401
 from adal.prompts.verifier import (
     DEEP_VERIFICATION_SYSTEM_PROMPT,
     DEEP_VERIFICATION_TEMPLATE,
@@ -14,7 +15,6 @@ from adal.prompts.verifier import (
 )
 from adal.tools.web_search import TOOL_DEFINITIONS as WEB_TOOLS
 from adal.tools.web_search import TOOL_EXECUTORS
-from adal.tui.widgets.debug_panel import VERBOSITY_HIGH, VERBOSITY_LOW, VERBOSITY_MED  # noqa: F401
 
 logger = structlog.get_logger(__name__)
 
@@ -45,10 +45,10 @@ class Verifier(BaseAgent):
         if settings.verifier_seed is not None:
             self.gen_params["seed"] = settings.verifier_seed
 
-    async def _think_smart(self, context: dict, thinking_enabled: bool = True, model: str | None = None, max_tool_turns: int | None = None, timeout_seconds: float | None = None) -> str:
+    async def _think_smart(self, context: dict, thinking_enabled: bool = True, model: str | None = None, max_tool_turns: int | None = None, timeout_seconds: float | None = None, json_mode: bool = False) -> str:
         if self.tools:
-            return await self.think_with_tools(context, max_tokens=49152, thinking_enabled=thinking_enabled, model=model, max_tool_turns=max_tool_turns or settings.verifier_max_tool_turns, timeout_seconds=timeout_seconds or settings.verifier_timeout)
-        return await self.think_with_retry(context, max_tokens=49152)
+            return await self.think_with_tools(context, max_tokens=49152, thinking_enabled=thinking_enabled, model=model, max_tool_turns=max_tool_turns or settings.verifier_max_tool_turns, timeout_seconds=timeout_seconds or settings.verifier_timeout, json_mode=json_mode)
+        return await self.think_with_retry(context, max_tokens=49152, json_mode=json_mode)
 
     async def verify(
         self,
@@ -104,7 +104,7 @@ class Verifier(BaseAgent):
         }
 
         self.log.info("verifier_starting", domain=domain)
-        response = await self._think_smart(context)
+        response = await self._think_smart(context, json_mode=True)
         result = self.parse_json_block(response)
 
         if "error" in result:
@@ -115,7 +115,7 @@ class Verifier(BaseAgent):
                 "You MUST output the complete JSON response with ALL required fields: "
                 "verdict, confidence, checks_performed, mathematical_proof, fatal_flaws, suggestions.]"
             )
-            response = await self._think_smart(retry_context)
+            response = await self._think_smart(retry_context, json_mode=True)
             result = self.parse_json_block(response)
 
         if result.get("error"):
@@ -239,7 +239,7 @@ class Verifier(BaseAgent):
         self.system_prompt = DEEP_VERIFICATION_SYSTEM_PROMPT
         try:
             self.log.info("deep_verification_starting", borderline_count=len(borderline))
-            response = await self._think_smart(context, thinking_enabled=False, model=self.sub_model, max_tool_turns=settings.deep_verify_max_tool_turns, timeout_seconds=settings.deep_verify_timeout)
+            response = await self._think_smart(context, thinking_enabled=False, model=self.sub_model, max_tool_turns=settings.deep_verify_max_tool_turns, timeout_seconds=settings.deep_verify_timeout, json_mode=True)
             result = self.parse_json_block(response)
             if self._debug_callback and "error" not in result:
                 deep_checks = result.get("checks_performed", [])
@@ -271,10 +271,8 @@ class Verifier(BaseAgent):
             for check in deep_checks:
                 if isinstance(check, dict):
                     key = check.get("check_name") or check.get("check") or check.get("name")
-                    if key and key in existing and check.get("result") in ("PASS", "FAIL"):
+                    if key and check.get("result") in ("PASS", "FAIL"):
                         existing[key] = check
-                    elif key and key not in existing and check.get("result") in ("PASS", "FAIL"):
-                        merged.setdefault("checks_performed", []).append(check)
             merged["checks_performed"] = list(existing.values())
 
         deep_flaws = deep.get("fatal_flaws", [])
@@ -399,8 +397,14 @@ class Verifier(BaseAgent):
             await self._debug_callback("verifier", "yield_check",
                 f"{status}: {msg}", verbosity=VERBOSITY_MED)
 
+        workup_search_text = statement
+        for key in ("workup_procedure", "synthesis_procedure", "isolation", "purification", "procedure"):
+            val = hyp.get(key, "")
+            if isinstance(val, str) and val.strip():
+                workup_search_text += " " + val.lower()
+
         has_workup = any(
-            phrase in statement
+            phrase in workup_search_text
             for phrase in ("workup", "work-up", "extract", "filter", "dry", "recrystallize",
                            "chromatography", "purif", "isolat", "wash", "brine", "aqueous",
                            "organic layer", "separatory")

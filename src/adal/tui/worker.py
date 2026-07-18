@@ -170,7 +170,7 @@ class OrcWorker:
         enriched = "\n\n".join(context_parts)
 
         try:
-            result = await self.orc.run_restore(enriched)
+            result = await self.orc.run_restore(enriched, state=state)
             self._safe_post_message(ResultReady(result))
         except asyncio.CancelledError:
             self._safe_post_message(ResultReady({"status": "cancelled", "domain": state.domain.value, "iterations": state.iteration}))

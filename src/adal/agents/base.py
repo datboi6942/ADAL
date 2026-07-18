@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from abc import ABC, abstractmethod
@@ -70,6 +71,7 @@ class BaseAgent(ABC):
         self.tools: list[dict] = []
         self.tool_executors: dict = {}
         self._search_cache: dict | None = None
+        self._enrich_cache: dict[tuple[str, str], str] = {}
         self.current_session_id: str | None = None
         self.current_iteration: int = 0
         self._memory = None
@@ -98,17 +100,22 @@ class BaseAgent(ABC):
                 query_text = context["hypothesis_json"]
 
             if query_text:
+                cache_key = (self.current_session_id, hashlib.md5(str(query_text).encode()).hexdigest()[:16])
+                if cache_key in self._enrich_cache:
+                    context["_session_memory"] = self._enrich_cache[cache_key]
+                    return context
                 if self._debug_callback:
                     await self._debug_callback("memory", "query",
                         f"Searching memory for: {str(query_text)[:200]}", verbosity=1)
                 memories = await self._memory.query_session_memory(
                     query_text=str(query_text)[:2000],
                     session_id=self.current_session_id,
-                    limit=min(settings.memory_max_episodic, 3),
+                    limit=min(settings.memory_max_episodic, settings.memory_enrich_context_cap),
                 )
                 if memories:
                     summary = "\n".join(f"- {m[:200].strip()}" for m in memories)
                     context["_session_memory"] = summary
+                    self._enrich_cache[cache_key] = summary
                     if self._debug_callback:
                         await self._debug_callback("memory", "found",
                             f"Found {len(memories)} memories — injecting into prompt", verbosity=1)
@@ -135,7 +142,7 @@ class BaseAgent(ABC):
     def build_prompt(self, context: dict) -> str:
         ...
 
-    async def think(self, context: dict, max_tokens: int | None = None, thinking_enabled: bool = True, model: str | None = None) -> str:
+    async def think(self, context: dict, max_tokens: int | None = None, thinking_enabled: bool = True, model: str | None = None, json_mode: bool = False) -> str:
         context = await self._enrich_context(context)
         prompt = self.build_prompt(context)
         self.log.debug("agent_thinking", prompt_length=len(prompt))
@@ -147,6 +154,7 @@ class BaseAgent(ABC):
             gen_params=self.gen_params,
             thinking_enabled=thinking_enabled,
             debug_callback=self._debug_callback,
+            json_mode=json_mode,
         )
         self.total_usage = _merge_usage(self.total_usage, response.usage)
         self.last_reasoning = response.reasoning
@@ -163,6 +171,7 @@ class BaseAgent(ABC):
                 gen_params=self.gen_params,
                 thinking_enabled=thinking_enabled,
                 debug_callback=self._debug_callback,
+                json_mode=json_mode,
             )
             self.total_usage = _merge_usage(self.total_usage, retry_response.usage)
             if retry_response.reasoning:
@@ -171,14 +180,14 @@ class BaseAgent(ABC):
 
         return content
 
-    async def think_with_retry(self, context: dict, max_retries: int = 2, max_tokens: int | None = None) -> str:
+    async def think_with_retry(self, context: dict, max_retries: int = 2, max_tokens: int | None = None, json_mode: bool = False) -> str:
         retry_note = ""
         first_reasoning: str | None = None
         for attempt in range(max_retries + 1):
             if retry_note:
                 context["_retry_note"] = retry_note
                 self.log.info("retry_attempt", attempt=attempt + 1, reason="empty_or_parse_error")
-            response = await self.think(context, max_tokens=max_tokens)
+            response = await self.think(context, max_tokens=max_tokens, json_mode=json_mode)
             if attempt == 0:
                 first_reasoning = self.last_reasoning
             if response.strip():
@@ -193,7 +202,7 @@ class BaseAgent(ABC):
                 )
         return response
 
-    async def think_with_tools(self, context: dict, max_tokens: int | None = None, max_tool_turns: int = settings.llm_max_tool_turns, thinking_enabled: bool = True, model: str | None = None, use_tools: bool = True, timeout_seconds: float | None = None) -> str:
+    async def think_with_tools(self, context: dict, max_tokens: int | None = None, max_tool_turns: int = settings.llm_max_tool_turns, thinking_enabled: bool = True, model: str | None = None, use_tools: bool = True, timeout_seconds: float | None = None, json_mode: bool = False) -> str:
         context = await self._enrich_context(context)
         prompt = self.build_prompt(context)
         self.log.debug("agent_thinking_tools", prompt_length=len(prompt), tools=len(self.tools))
@@ -224,6 +233,7 @@ class BaseAgent(ABC):
             thinking_enabled=thinking_enabled,
             debug_callback=self._debug_callback,
             timeout_seconds=timeout_seconds,
+            json_mode=json_mode,
         )
         self.total_usage = _merge_usage(self.total_usage, response.usage)
         self.last_reasoning = response.reasoning
@@ -240,6 +250,7 @@ class BaseAgent(ABC):
                 gen_params=self.gen_params,
                 thinking_enabled=thinking_enabled,
                 debug_callback=self._debug_callback,
+                json_mode=json_mode,
             )
             self.total_usage = _merge_usage(self.total_usage, retry_response.usage)
             if retry_response.reasoning:

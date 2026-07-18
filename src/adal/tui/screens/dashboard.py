@@ -1,5 +1,4 @@
 import asyncio
-import random
 import time
 
 from textual.binding import Binding
@@ -17,15 +16,13 @@ from adal.tui.widgets.debug_panel import (
     DebugLine,
     DebugPanel,
 )
-from adal.tui.widgets.loading_spinner import AGENT_ICONS, BAR_WIDTH, GRADIENT, SPARKLE_CHARS
 from adal.tui.widgets.query_input import CommandInput, CommandSubmit, QuerySubmit
+from adal.tui.widgets.status_animatable import StatusAnimatableMixin
 from adal.tui.widgets.suggestion_list import SuggestionList
 from adal.tui.worker import OrcWorker, ReasoningUpdate, ResultReady, StatusUpdate, ToolCallUpdate
 
-AGENT_LABELS = {"planner": "PLANNER", "proposer": "PROPOSER", "verifier": "VERIFIER", "decision": "DECISION"}
 
-
-class DashboardScreen(Screen):
+class DashboardScreen(Screen, StatusAnimatableMixin):
     COMPONENT_CLASSES = {"input"}
 
     BINDINGS = [
@@ -74,88 +71,10 @@ class DashboardScreen(Screen):
         line.remove_class("idle", "running", "done", "error-state")
         line.add_class(state)
 
-    def _update_status(self, text: str):
-        self.query_one("#status-text", Static).update(f"[dim]{text}[/dim]")
+    _status_label_fallback = "Initializing"
 
-    def _start_status_animation(self):
+    def _on_status_animation_started(self):
         self._set_status_state("running")
-        self._tick_count = 0
-        self._ticking = True
-        if self._status_timer is None:
-            self._status_timer = self.set_timer(0.15, self._status_tick)
-
-    def _stop_status_animation(self):
-        self._ticking = False
-        if self._status_timer:
-            self._status_timer.stop()
-            self._status_timer = None
-
-    def _status_tick(self):
-        try:
-            self._tick_count += 1
-            elapsed = int(time.time() - self._start_time) if self._start_time > 0 else 0
-            m, s = divmod(max(elapsed, 0), 60)
-            agent_key = self._current_agent or ""
-
-            icon = AGENT_ICONS.get(agent_key, "\u269b")
-            pulse_val = ((self._tick_count // 2) % 16) - 8
-            if pulse_val < 0:
-                icon = f"[dim]{icon}[/dim]"
-            elif pulse_val > 0:
-                icon = f"[bold]{icon}[/bold]"
-
-            fill_pct = self._iter / self._max_iters if self._max_iters > 0 else 0
-            filled = int(fill_pct * BAR_WIDTH)
-
-            bar_chars = []
-            for i in range(BAR_WIDTH):
-                wave_dist = (i - (self._tick_count % BAR_WIDTH)) % BAR_WIDTH
-                if wave_dist < BAR_WIDTH // 2:
-                    wave_bright = wave_dist / (BAR_WIDTH // 2)
-                else:
-                    wave_bright = (BAR_WIDTH - wave_dist) / (BAR_WIDTH // 2)
-                if i < filled:
-                    color_idx = (i + self._tick_count // 6) % len(GRADIENT)
-                    bar_chars.append(f"[{GRADIENT[color_idx]}]\u2588[/{GRADIENT[color_idx]}]")
-                elif i == filled:
-                    color_idx = (i + self._tick_count // 6) % len(GRADIENT)
-                    bar_chars.append(f"[{GRADIENT[color_idx]}]\u2593[/{GRADIENT[color_idx]}]")
-                elif i == filled + 1:
-                    bar_chars.append("[dim]\u2591[/dim]")
-                else:
-                    if random.random() < wave_bright * 0.08:
-                        bar_chars.append("[dim]\u2592[/dim]")
-                    else:
-                        bar_chars.append("[dim]\u2591[/dim]")
-
-            sparkle = " "
-            if filled < BAR_WIDTH and random.random() < 0.12:
-                sparkle_char = random.choice(SPARKLE_CHARS)
-                col = GRADIENT[(filled + self._tick_count // 6) % len(GRADIENT)]
-                sparkle = f"[{col}]{sparkle_char}[/{col}]"
-
-            bar = "".join(bar_chars)
-            agent_label = AGENT_LABELS.get(agent_key, "")
-            agent_icon = AGENT_ICONS.get(agent_key, "\u269b")
-            if agent_label:
-                label = f"[bold]{agent_icon} {agent_label}[/bold]"
-            else:
-                label = f"[dim]{agent_icon} Initializing[/dim]"
-
-            line = (
-                f"{icon} {bar} {sparkle} "
-                f"[bold]{self._iter}/{self._max_iters}[/bold] "
-                f"{m}:{s:02d}  {label}"
-            )
-            self.query_one("#status-text", Static).update(line)
-        except Exception:
-            t = int(time.time() - self._start_time) if self._start_time > 0 else 0
-            m, s = divmod(t, 60)
-            self.query_one("#status-text", Static).update(
-                f"Iter {self._iter}/{self._max_iters}  {m}:{s:02d}"
-            )
-        if self._ticking:
-            self._status_timer = self.set_timer(0.15, self._status_tick)
 
     def on_query_submit(self, event: QuerySubmit):
         query = event.query
@@ -475,6 +394,8 @@ class DashboardScreen(Screen):
             "/back": self._cmd_back,
             "/quit": self._cmd_quit,
             "/exit": self._cmd_quit,
+            "/telemetry": self._cmd_telemetry,
+            "/diagnostics": self._cmd_diagnostics,
         }
 
         handler = handlers.get(cmd_name)
@@ -609,6 +530,26 @@ class DashboardScreen(Screen):
 
     def _cmd_quit(self, _args: str):
         self.app.exit()
+
+    def _cmd_telemetry(self, args: str):
+        if args.lower() in ("on", "1", "true", "enable"):
+            settings.telemetry_enabled = True
+            if self._worker and self._worker.orc:
+                self._worker.orc.set_telemetry(True)
+            self._update_status("\U0001f9e0  Cognitive telemetry ENABLED")
+            self.notify("Cognitive telemetry enabled — observer will run after each iteration", title="Telemetry")
+        elif args.lower() in ("off", "0", "false", "disable"):
+            settings.telemetry_enabled = False
+            if self._worker and self._worker.orc:
+                self._worker.orc.set_telemetry(False)
+            self._update_status("Telemetry disabled")
+            self.notify("Cognitive telemetry disabled", title="Telemetry")
+        else:
+            status = "ON" if settings.telemetry_enabled else "OFF"
+            self.notify(f"Cognitive telemetry: {status}\nUsage: /telemetry [on/off]", title="Telemetry")
+
+    def _cmd_diagnostics(self, _args: str):
+        self.app.push_telemetry_dashboard()
 
     def on_key(self, event):
         if event.key == "tab" and isinstance(self.focused, CommandInput):
