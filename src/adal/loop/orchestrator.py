@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 import structlog
 from sqlalchemy import desc, select
 
-from adal.agents.base import _empty_usage, _merge_usage
 from adal.agents.planner import Planner
 from adal.agents.proposer import Proposer
 from adal.agents.verifier import Verifier
@@ -32,6 +31,18 @@ from adal.db.models import (
 from adal.db.session import get_sessionmaker
 from adal.llm.client import _calculate_cost
 from adal.memory.store import MemoryStore
+
+
+def _empty_usage() -> dict:
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
+
+
+def _merge_usage(a: dict, b: dict) -> dict:
+    return {
+        k: a.get(k, 0) + b.get(k, 0)
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens")
+    }
+
 
 logger = structlog.get_logger(__name__)
 
@@ -218,13 +229,11 @@ class Orchestrator:
             usage=plan_usage,
         )
 
+        proposer_crash_streak = 0
+        invalid_action_streak = 0
         while state.iteration < settings.max_iterations:
             state.iteration += 1
-            proposer_crash_streak = 0
-            invalid_action_streak = 0
             revision_attempted = False
-            proposer_crash_streak = 0
-            invalid_action_streak = 0
             logger.info("iteration_start", iteration=state.iteration, session_id=session_id)
             await self._dispatch_debug("fsm", "iteration", f"Iter {state.iteration}/{settings.max_iterations}  domain={state.domain.value}  failures={len(state.prior_failures)}  validated={len(state.validated_results)}")
 
@@ -855,6 +864,7 @@ class Orchestrator:
         if query:
             state.query = query
 
+        invalid_action_streak = 0
         while state.iteration < settings.max_iterations:
             state.iteration += 1
 
@@ -882,9 +892,15 @@ class Orchestrator:
             action_raw = planner_decision.get("action", "continue")
             try:
                 action = PlannerAction(action_raw.lower())
+                invalid_action_streak = 0
             except ValueError:
-                logger.warning("planner_invalid_action", raw=action_raw)
-                action = PlannerAction.CONTINUE
+                invalid_action_streak += 1
+                logger.warning("planner_invalid_action", raw=action_raw, streak=invalid_action_streak)
+                if invalid_action_streak >= 3:
+                    logger.error("planner_invalid_action_limit", streak=invalid_action_streak)
+                    action = PlannerAction.FAIL
+                else:
+                    action = PlannerAction.CONTINUE
             if action == PlannerAction.CONVERGE:
                 state.status = SessionStatus.CONVERGED
                 state.final_answer = planner_decision.get("final_answer", "")
@@ -952,6 +968,8 @@ class Orchestrator:
         await self._wire_memory(session_id)
 
 
+        proposer_crash_streak = 0
+        invalid_action_streak = 0
         while state.iteration < settings.max_iterations:
             state.iteration += 1
 
@@ -968,13 +986,20 @@ class Orchestrator:
             except Exception as e:
                 logger.error("proposer_failed", error=str(e))
                 await self._display_step("proposer", "error", str(e)[:80])
-                state.prior_failures.append({"iteration": state.iteration, "hypothesis_summary": f"Proposer crashed: {e}", "reason": f"Proposer error: {e}"})
+                state.prior_failures.append({"iteration": state.iteration, "hypothesis_summary": f"Proposer crashed: {e}", "fatal_flaws": [f"Proposer crashed: {type(e).__name__}"], "reason": f"Proposer error: {e}"})
+                proposer_crash_streak += 1
+                if proposer_crash_streak >= 3:
+                    logger.error("proposer_crash_streak_limit_restore", streak=proposer_crash_streak)
+                    state.status = SessionStatus.FAILED
+                    await self._update_session(state)
+                    return await self._finalize(state)
                 current_directive = f"Previous proposer attempt failed with error: {e}. Try a different approach."
                 await self._update_session(state)
                 await self._dispatch_debug("db", "session_update",
                     f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
                 continue
 
+            proposer_crash_streak = 0
             prop_usage = self._capture_usage(self.proposer)
             await self._display_reasoning("PROPOSER", self.proposer.last_reasoning, verbosity=VERBOSITY_MED)
             if self.proposer.last_reasoning:

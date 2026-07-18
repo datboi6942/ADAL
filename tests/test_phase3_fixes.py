@@ -109,7 +109,8 @@ class TestSelfCritiqueSkip:
     """Fix 3a-B: Self-critique skipped on first iteration."""
 
     @pytest.mark.asyncio
-    async def test_skipped_on_first_iteration(self):
+    async def test_self_critique_runs_on_first_iteration(self):
+        """Fix C: Self-critique now runs even with empty previous_attempts."""
         from adal.agents.proposer import Proposer
 
         proposer = Proposer()
@@ -124,19 +125,26 @@ class TestSelfCritiqueSkip:
                 '"python_script": ""}'
             )
 
-        mock_critique = AsyncMock()
+        async def mock_self_critique(result, prev, domain):
+            return {
+                "issues_found": [],
+                "suggested_fix": "",
+                "confidence_adjustment": 0.0,
+            }
 
         with (
             patch.object(proposer, "_think_smart", side_effect=mock_think_smart),
-            patch.object(proposer, "_self_critique", mock_critique),
+            patch.object(proposer, "_self_critique", side_effect=mock_self_critique),
         ):
-            await proposer.propose(
+            result = await proposer.propose(
                 directive="test",
                 domain="chemistry",
                 previous_attempts=[],
             )
 
-        mock_critique.assert_not_called()
+        assert "_self_critique" in result, (
+            "Self-critique should run on first iteration (empty previous_attempts)"
+        )
 
 
 class TestCacheLRUBounds:
