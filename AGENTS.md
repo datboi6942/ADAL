@@ -30,10 +30,12 @@ Domain classification is keyword-regex-based in `agents/planner.py:classify_doma
 Invalid domain strings are caught by `_safe_domain()` → defaults to `UNKNOWN`.
 
 ### Sub-Agent Model Routing
-Secondary LLM calls (self-critique, deep verification, revision, planner parse-failure
-retry) use a **cheaper sub-model** (`deepseek-v4-chat` by default) with **thinking
-disabled**. Primary calls (main propose, main verify, main plan) still use
-`deepseek-v4-pro` with `reasoning_effort="max"`.
+Complex self-reflection/correction calls (self-critique, deep verification, revision) use
+the **primary model** (`deepseek-v4-pro` by default) with **thinking enabled**
+(`reasoning_effort="max"`) for maximum intelligence — these catch subtle issues. Only
+the planner parse-failure retry uses a cheaper sub-model with thinking disabled, since
+it's a mechanical JSON re-parse. Primary calls (main propose, main verify, main plan)
+still use `deepseek-v4-pro` with `reasoning_effort="max"`.
 
 Per-call granularity: every `_think_smart(context, thinking_enabled=..., model=...)`
 call chooses model + thinking independently. Configurable per-provider in
@@ -118,7 +120,7 @@ It uses `_think_smart()` with full tool access (web_search, fetch_url, calculate
 `SELF_CRITIQUE_SYSTEM_PROMPT` (separate from the Proposer's main system prompt) to prevent
 role confusion where the model thinks it's still generating hypotheses. Expanded checklist:
 stoichiometry, yield, thermodynamics, workup, equipment, precursors, math, moisture/air
-sensitivity. Runs as a sub-model call (`deepseek-v4-chat`, no thinking).
+sensitivity. Uses the primary model with full thinking enabled for maximum intelligence.
 
 Results (`confidence_adjustment`, `suggested_fix`, `issues_found`) are automatically applied
 to the hypothesis before sandbox execution — confidence is clamped to [0.0, 1.0], suggested
@@ -269,7 +271,7 @@ Every agent system prompt now includes a hardened TOOL USAGE POLICY section:
 - `.env` loaded by Pydantic `BaseSettings` with `extra="ignore"`.
 - `deepseek_max_tokens` is **not 8K**. Their DeepSeek V4 Pro model accepts large context. Default is 65536.
 - `reasoning_effort="max"` with `extra_body={"thinking": {"type": "enabled"}}`.
-  Forced final answer and sub-model calls strip both.
+  Forced final answer and planner parse-failure retry strip both.
 - `OPENAI_API_KEY` only needed for embeddings. Memory system gracefully degrades without it.
 - `llm_max_tool_turns=12` is the global default, overridden by per-agent limits:
   `planner_max_tool_turns=2`, `planner_initial_tool_turns=0`, `proposer_max_tool_turns=6`,
@@ -280,7 +282,7 @@ Every agent system prompt now includes a hardened TOOL USAGE POLICY section:
   `revise_timeout=45`.
 - `max_parallel_tools=2` — max tools executed per LLM turn.
 - `tool_fail_streak_limit=3` — consecutive failures before forced answer.
-- Sub-model defaults: `deepseek_sub_model="deepseek-v4-chat"` (cheap, no thinking),
+- Sub-model defaults (used only by planner parse-failure retry): `deepseek_sub_model="deepseek-v4-chat"` (cheap, no thinking),
   `openai_sub_model="gpt-4o-mini"`, with per-provider overrides.
 - Config fields `search_max_retries`, `fetch_max_retries`, and `memory_query_oversample_factor`
   use `Field(ge=, le=)` validators to prevent silent breakage from out-of-range values.

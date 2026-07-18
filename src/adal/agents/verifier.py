@@ -239,7 +239,7 @@ class Verifier(BaseAgent):
         self.system_prompt = DEEP_VERIFICATION_SYSTEM_PROMPT
         try:
             self.log.info("deep_verification_starting", borderline_count=len(borderline))
-            response = await self._think_smart(context, thinking_enabled=False, model=self.sub_model, max_tool_turns=settings.deep_verify_max_tool_turns, timeout_seconds=settings.deep_verify_timeout, json_mode=True)
+            response = await self._think_smart(context, max_tool_turns=settings.deep_verify_max_tool_turns, timeout_seconds=settings.deep_verify_timeout, json_mode=True)
             result = self.parse_json_block(response)
             if self._debug_callback and "error" not in result:
                 deep_checks = result.get("checks_performed", [])
