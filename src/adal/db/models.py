@@ -54,6 +54,13 @@ class PlannerAction(enum.StrEnum):
     FAIL = "fail"
 
 
+class DiagnosticSeverity(enum.StrEnum):
+    LOW = "low"
+    MED = "med"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
 class Session(Base):
     __tablename__ = "sessions"
 
@@ -73,6 +80,7 @@ class Session(Base):
 
     hypotheses: Mapped[list["Hypothesis"]] = relationship(back_populates="session", order_by="Hypothesis.iteration")
     interactions: Mapped[list["AgentInteraction"]] = relationship(back_populates="session")
+    meta_diagnostics: Mapped[list["MetaDiagnostic"]] = relationship(back_populates="session")
 
 
 class Hypothesis(Base):
@@ -154,3 +162,20 @@ class PlannerDecision(Base):
     )
 
     hypothesis: Mapped["Hypothesis"] = relationship(back_populates="planner_decisions")
+
+
+class MetaDiagnostic(Base):
+    __tablename__ = "meta_diagnostics"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), nullable=False)
+    iteration: Mapped[int] = mapped_column(Integer, nullable=False)
+    pattern_detected: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    severity: Mapped[DiagnosticSeverity] = mapped_column(Enum(DiagnosticSeverity), default=DiagnosticSeverity.LOW)
+    debugger_critique: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    system_recommendation: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=lambda: datetime.datetime.now(datetime.UTC)
+    )
+
+    session: Mapped["Session"] = relationship(back_populates="meta_diagnostics")

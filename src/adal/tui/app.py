@@ -19,6 +19,7 @@ from adal.tui.screens.settings.models import ModelSettingsScreen
 from adal.tui.screens.settings.pricing import PricingSettingsScreen
 from adal.tui.screens.settings.search import SearchSettingsScreen
 from adal.tui.screens.settings.theme import ThemeSettingsScreen
+from adal.tui.screens.telemetry_dashboard import TelemetryDashboardScreen
 from adal.tui.screens.welcome import WelcomeScreen
 from adal.tui.widgets.palette import ADALProvider
 
@@ -339,6 +340,8 @@ class ADALApp(App):
             self.push_settings(action.replace("settings_", ""))
         elif action == "delete":
             self.notify("Delete not yet implemented", title="Session")
+        elif action == "telemetry":
+            self.push_telemetry_dashboard()
 
     def push_settings(self, name: str):
         screens = {
@@ -364,6 +367,9 @@ class ADALApp(App):
 
     def push_history(self):
         self.push_screen(HistoryScreen())
+
+    def push_telemetry_dashboard(self):
+        self.push_screen(TelemetryDashboardScreen())
 
     def action_stop(self):
         screen = self.screen

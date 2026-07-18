@@ -86,36 +86,35 @@ class Proposer(BaseAgent):
             }
 
         try:
-            if previous_attempts:
+            if self._debug_callback:
+                await self._debug_callback("proposer", "self_critique_start",
+                    "Running self-critique checklist (stoichiometry, yield, thermo, workup, equipment, precursors, math, sensitivity)")
+            critique = await self._self_critique(result, previous_attempts, domain)
+            if critique:
+                result["_self_critique"] = critique
+                hyp = result.get("hypothesis", {})
+                if isinstance(hyp, dict):
+                    adj = critique.get("confidence_adjustment", 0)
+                    current_conf = hyp.get("confidence", 0)
+                    if isinstance(current_conf, (int, float)):
+                        hyp["confidence"] = max(0.0, min(1.0, current_conf + adj))
+                suggested_fix = critique.get("suggested_fix", "")
+                if suggested_fix:
+                    existing_summary = result.get("analysis_summary", "")
+                    result["analysis_summary"] = f"{existing_summary}\n\n[Self-Critique Correction]: {suggested_fix}"
+                issues = critique.get("issues_found", [])
+                if issues and isinstance(result.get("hypothesis"), dict):
+                    hyp_notes = result["hypothesis"].get("notes", "")
+                    result["hypothesis"]["notes"] = f"{hyp_notes}\n[Self-Critique flagged]: {'; '.join(issues[:5])}" if hyp_notes else f"[Self-Critique flagged]: {'; '.join(issues[:5])}"
                 if self._debug_callback:
-                    await self._debug_callback("proposer", "self_critique_start",
-                        "Running self-critique checklist (stoichiometry, yield, thermo, workup, equipment, precursors, math, sensitivity)")
-                critique = await self._self_critique(result, previous_attempts, domain)
-                if critique:
-                    result["_self_critique"] = critique
-                    hyp = result.get("hypothesis", {})
-                    if isinstance(hyp, dict):
-                        adj = critique.get("confidence_adjustment", 0)
-                        current_conf = hyp.get("confidence", 0)
-                        if isinstance(current_conf, (int, float)):
-                            hyp["confidence"] = max(0.0, min(1.0, current_conf + adj))
-                    suggested_fix = critique.get("suggested_fix", "")
-                    if suggested_fix:
-                        existing_summary = result.get("analysis_summary", "")
-                        result["analysis_summary"] = f"{existing_summary}\n\n[Self-Critique Correction]: {suggested_fix}"
-                    issues = critique.get("issues_found", [])
-                    if issues and isinstance(result.get("hypothesis"), dict):
-                        hyp_notes = result["hypothesis"].get("notes", "")
-                        result["hypothesis"]["notes"] = f"{hyp_notes}\n[Self-Critique flagged]: {'; '.join(issues[:5])}" if hyp_notes else f"[Self-Critique flagged]: {'; '.join(issues[:5])}"
-                    if self._debug_callback:
-                        for issue in issues[:8]:
-                            await self._debug_callback("proposer", "critique_item",
-                                f"Self-critique found: {issue}", verbosity=VERBOSITY_MED)
-                        if not issues:
-                            await self._debug_callback("proposer", "critique_clean",
-                                "Self-critique: no issues found", verbosity=VERBOSITY_MED)
-                        await self._debug_callback("proposer", "self_critique_done",
-                            f"Found {len(issues)} issues, confidence adjustment {critique.get('confidence_adjustment', 0):+}, applied")
+                    for issue in issues[:8]:
+                        await self._debug_callback("proposer", "critique_item",
+                            f"Self-critique found: {issue}", verbosity=VERBOSITY_MED)
+                    if not issues:
+                        await self._debug_callback("proposer", "critique_clean",
+                            "Self-critique: no issues found", verbosity=VERBOSITY_MED)
+                    await self._debug_callback("proposer", "self_critique_done",
+                        f"Found {len(issues)} issues, confidence adjustment {critique.get('confidence_adjustment', 0):+}, applied")
         except Exception as e:
             self.log.info("self_critique_skipped", error=str(e))
 

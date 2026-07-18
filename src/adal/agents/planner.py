@@ -6,11 +6,11 @@ import structlog
 
 from adal.agents.base import BaseAgent
 from adal.config import settings
+from adal.constants import VERBOSITY_HIGH, VERBOSITY_LOW, VERBOSITY_MED  # noqa: F401
 from adal.db.models import Domain
 from adal.prompts.planner import PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE
 from adal.tools.web_search import TOOL_DEFINITIONS as WEB_TOOLS
 from adal.tools.web_search import TOOL_EXECUTORS
-from adal.tui.widgets.debug_panel import VERBOSITY_HIGH, VERBOSITY_LOW, VERBOSITY_MED  # noqa: F401
 
 logger = structlog.get_logger(__name__)
 
