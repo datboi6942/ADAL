@@ -13,13 +13,16 @@ from adal.agents.planner import Planner
 from adal.agents.proposer import Proposer
 from adal.agents.verifier import Verifier
 from adal.config import settings
+from adal.constants import VERBOSITY_HIGH, VERBOSITY_LOW, VERBOSITY_MED
 from adal.db.models import (
     AgentInteraction,
     AgentRole,
+    DiagnosticSeverity,
     Domain,
     Hypothesis,
     HypothesisStatus,
     InteractionDirection,
+    MetaDiagnostic,
     PlannerAction,
     PlannerDecision,
     Session,
@@ -29,7 +32,6 @@ from adal.db.models import (
 from adal.db.session import get_sessionmaker
 from adal.llm.client import _calculate_cost
 from adal.memory.store import MemoryStore
-from adal.tui.widgets.debug_panel import VERBOSITY_HIGH, VERBOSITY_LOW, VERBOSITY_MED
 
 logger = structlog.get_logger(__name__)
 
@@ -76,10 +78,14 @@ class Orchestrator:
         self._verbose_display: Callable | None = None
         self._debug: Callable | None = None
         self.memory_store = MemoryStore()
+        from adal.agents.meta_debugger import MetaDebuggerAgent
+        self.debugger = MetaDebuggerAgent(model=settings.telemetry_model)
+        self._telemetry_enabled = settings.telemetry_enabled
         self.proposer._debug_callback = self._dispatch_debug
         self.verifier._debug_callback = self._dispatch_debug
         self.planner._debug_callback = self._dispatch_debug
         self.memory_store._debug_callback = self._dispatch_debug
+        self.debugger._debug_callback = self._dispatch_debug
 
     def set_display_callback(self, callback: Callable):
         self._display = callback
@@ -765,6 +771,9 @@ class Orchestrator:
             elif action == PlannerAction.CONTINUE:
                 current_directive = directive
 
+            if self._telemetry_enabled and state.iteration % settings.telemetry_interval == 0:
+                asyncio.create_task(self._run_telemetry(state))
+
             await self._update_session(state)
             await self._dispatch_debug("db", "session_update",
                 f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
@@ -1297,6 +1306,117 @@ class Orchestrator:
             db.add(decision)
             await db.commit()
             logger.debug("db_persist", table="planner_decisions", id=decision.id[:8])
+
+    def set_telemetry(self, enabled: bool):
+        self._telemetry_enabled = enabled
+
+    async def _run_telemetry(self, state: LoopState):
+        try:
+            snapshot = await self._build_telemetry_snapshot(state)
+            if not snapshot:
+                return
+
+            await self._dispatch_debug("telemetry", "start",
+                f"Iter {state.iteration}: analyzing {snapshot.get('iteration_count', 0)} iterations",
+                verbosity=VERBOSITY_LOW)
+
+            result = await self.debugger.observe(snapshot)
+
+            highest_severity = "low"
+            for p in result.get("patterns_detected", []):
+                sev = (p.get("severity") or "low").lower()
+                if sev in ("high", "critical"):
+                    highest_severity = sev
+                elif sev == "med" and highest_severity not in ("high", "critical"):
+                    highest_severity = "med"
+
+            await self._persist_telemetry(state, result)
+
+            await self._dispatch_debug("telemetry", "result",
+                f"Health={result.get('overall_health', '?')} "
+                f"patterns={len(result.get('patterns_detected', []))} "
+                f"highest={highest_severity}",
+                verbosity=VERBOSITY_LOW)
+
+            for p in result.get("patterns_detected", [])[:4]:
+                sev = p.get("severity", "?").upper()
+                pat = p.get("pattern", "?")
+                crit = p.get("critique", "")[:200]
+                await self._dispatch_debug("telemetry", "pattern",
+                    f"[{sev}] {pat}: {crit}",
+                    verbosity=VERBOSITY_MED)
+
+        except Exception as e:
+            logger.error("telemetry_failed", error=str(e))
+            await self._dispatch_debug("telemetry", "error",
+                f"Telemetry crashed: {e}", verbosity=VERBOSITY_LOW)
+
+    async def _build_telemetry_snapshot(self, state: LoopState) -> dict | None:
+        if len(state.hypotheses) < 2:
+            return None
+        iterations = []
+        for i, h in enumerate(state.hypotheses):
+            v = None
+            for vr in state.validated_results:
+                if vr.get("iteration") == i + 1:
+                    v = vr
+                    break
+            verdict = v.get("verdict", {}) if v else {}
+            iterations.append({
+                "iteration": i + 1,
+                "hypothesis_statement": str(h.get("hypothesis", {}).get("statement", ""))[:500],
+                "analysis_summary": str(h.get("analysis_summary", ""))[:300],
+                "verdict": verdict.get("verdict", "UNKNOWN"),
+                "confidence": verdict.get("confidence", 0.0),
+                "fatal_flaws": verdict.get("fatal_flaws", []),
+                "suggestions": verdict.get("suggestions", []),
+            })
+        return {
+            "session_id": state.session_id,
+            "query": state.query,
+            "domain": state.domain.value,
+            "iteration_count": len(iterations),
+            "current_iteration": state.iteration,
+            "iterations": iterations,
+            "total_failures": len(state.prior_failures),
+            "total_validated": len(state.validated_results),
+        }
+
+    async def _persist_telemetry(self, state: LoopState, result: dict):
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as db:
+            patterns = result.get("patterns_detected", [])
+            if patterns:
+                for p in patterns:
+                    sev_str = (p.get("severity") or "low").lower()
+                    try:
+                        sev = DiagnosticSeverity(sev_str)
+                    except ValueError:
+                        sev = DiagnosticSeverity.LOW
+                    diag = MetaDiagnostic(
+                        session_id=state.session_id,
+                        iteration=state.iteration,
+                        pattern_detected=p.get("pattern", "unknown"),
+                        severity=sev,
+                        debugger_critique=p.get("critique", ""),
+                        system_recommendation=p.get("recommendation", ""),
+                    )
+                    db.add(diag)
+            else:
+                diag = MetaDiagnostic(
+                    session_id=state.session_id,
+                    iteration=state.iteration,
+                    pattern_detected="none",
+                    severity=DiagnosticSeverity.LOW,
+                    debugger_critique="No anti-patterns detected",
+                    system_recommendation="",
+                )
+                db.add(diag)
+            await db.commit()
+            count = max(len(patterns), 1)
+            await self._dispatch_debug("db", "telemetry_persist",
+                f"{count} MetaDiagnostic row(s) for iter {state.iteration}",
+                verbosity=VERBOSITY_HIGH)
 
 
 def _reasoning_tag(reasoning: str | None) -> str:

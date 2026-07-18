@@ -1,6 +1,15 @@
 from sqlalchemy import desc, func, select
 
-from adal.db.models import AgentInteraction, Domain, Hypothesis, HypothesisStatus, Session, ValidationResult
+from adal.db.models import (
+    AgentInteraction,
+    DiagnosticSeverity,
+    Domain,
+    Hypothesis,
+    HypothesisStatus,
+    MetaDiagnostic,
+    Session,
+    ValidationResult,
+)
 from adal.db.session import get_sessionmaker
 
 
@@ -92,3 +101,31 @@ async def delete_session(session_id: str):
         if session:
             await db.delete(session)
             await db.commit()
+
+
+async def get_meta_diagnostics(severity: str | None = None, limit: int = 200):
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as db:
+        stmt = (
+            select(MetaDiagnostic, Session.query, Session.domain)
+            .join(Session, MetaDiagnostic.session_id == Session.id)
+            .order_by(desc(MetaDiagnostic.created_at))
+        )
+        if severity:
+            try:
+                sev = DiagnosticSeverity(severity)
+                stmt = stmt.where(MetaDiagnostic.severity == sev)
+            except ValueError:
+                pass
+        result = await db.execute(stmt.limit(limit))
+        return result.all()
+
+
+async def get_diagnostic_stats():
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as db:
+        result = await db.execute(
+            select(MetaDiagnostic.severity, func.count(MetaDiagnostic.id))
+            .group_by(MetaDiagnostic.severity)
+        )
+        return dict(result.all())

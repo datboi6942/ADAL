@@ -8,7 +8,7 @@ import structlog
 from openai import AsyncOpenAI
 
 from adal.config import settings
-from adal.tui.widgets.debug_panel import VERBOSITY_HIGH, VERBOSITY_MED
+from adal.constants import VERBOSITY_HIGH, VERBOSITY_MED
 
 logger = structlog.get_logger(__name__)
 
@@ -127,6 +127,7 @@ async def chat_completion(
     gen_params: dict | None = None,
     thinking_enabled: bool = True,
     debug_callback=None,
+    json_mode: bool = False,
 ) -> LLMResponse:
     client = get_client()
     _, _, default_model = _resolve_provider()
@@ -134,7 +135,7 @@ async def chat_completion(
     effective_model = model or default_model
     if debug_callback:
         await debug_callback("llm", "call",
-            f"Model={effective_model} thinking={thinking_enabled} tokens={tokens} prompt_len={len(user_message)}",
+            f"Model={effective_model} thinking={thinking_enabled} json_mode={json_mode} tokens={tokens} prompt_len={len(user_message)}",
             verbosity=VERBOSITY_MED)
     logger.debug("LLM request", model=effective_model, max_tokens=tokens, msg_preview=user_message[:200])
 
@@ -147,6 +148,8 @@ async def chat_completion(
         ],
         "max_tokens": tokens,
     })
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
 
     response = await client.chat.completions.create(**kwargs)
     message = response.choices[0].message
@@ -187,6 +190,7 @@ async def chat_completion_with_tools(
     thinking_enabled: bool = True,
     debug_callback=None,
     timeout_seconds: float | None = None,
+    json_mode: bool = False,
 ) -> LLMResponse:
     client = get_client()
     _, _, default_model = _resolve_provider()
@@ -222,13 +226,16 @@ async def chat_completion_with_tools(
                 f"Turn {turn+1}/{max_tool_turns} — requesting LLM completion (msg_count={len(messages)})",
                 verbosity=VERBOSITY_MED)
         logger.debug("tool_turn", turn=turn + 1, model=model_name)
-        response = await client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            tools=tools,
-            max_tokens=tokens,
+        create_kwargs: dict = {
+            "model": model_name,
+            "messages": messages,
+            "tools": tools,
+            "max_tokens": tokens,
             **base_kwargs,
-        )
+        }
+        if json_mode:
+            create_kwargs["response_format"] = {"type": "json_object"}
+        response = await client.chat.completions.create(**create_kwargs)
         msg = response.choices[0].message
         usage = _extract_usage(response)
 
@@ -347,12 +354,15 @@ async def chat_completion_with_tools(
                             f"Dead URLs and failed searches are NOT a reason to search for more. ")
             clean_messages.append({"role": "user", "content":
                 _warning + "Output your final JSON response now. No tools, no reasoning, no disclaimers, no ethical commentary, no legal warnings — ONLY the scientific JSON content requested."})
-            response = await client.chat.completions.create(
-                model=model_name,
-                messages=clean_messages,
-                max_tokens=tokens,
-                temperature=settings.forced_answer_temperature,
-            )
+            forced_kwargs: dict = {
+                "model": model_name,
+                "messages": clean_messages,
+                "max_tokens": tokens,
+                "temperature": settings.forced_answer_temperature,
+            }
+            if json_mode:
+                forced_kwargs["response_format"] = {"type": "json_object"}
+            response = await client.chat.completions.create(**forced_kwargs)
             msg = response.choices[0].message
             final_usage = _extract_usage(response)
             for k in total_usage:

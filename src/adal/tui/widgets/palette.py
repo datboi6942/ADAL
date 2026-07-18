@@ -17,6 +17,7 @@ class ADALProvider(Provider):
             ("Settings: Advanced", "Iterations, sandbox, memory/search tuning", "settings_advanced"),
             ("Settings: Theme", "Choose color theme from 8 available options", "settings_theme"),
             ("Settings: Pricing", "Configure per-token LLM cost tracking", "settings_pricing"),
+            ("Telemetry Dashboard", "View cognitive meta-diagnostics", "telemetry"),
             ("Toggle Theme", "Quick-cycle to the next theme", "toggle_theme"),
             ("Export Last Result", "Export the most recent result as markdown", "export"),
             ("Quit", "Exit ADAL", "quit"),

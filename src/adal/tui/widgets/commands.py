@@ -24,6 +24,8 @@ COMMAND_REGISTRY: list[SlashCommand] = [
     SlashCommand("/back", "Go to the previous screen"),
     SlashCommand("/quit", "Exit ADAL (alias: /exit)"),
     SlashCommand("/exit", "Exit ADAL (alias: /quit)"),
+    SlashCommand("/telemetry", "Toggle cognitive telemetry debugger on/off", "/telemetry [on/off]"),
+    SlashCommand("/diagnostics", "View cognitive telemetry dashboard", "/diagnostics"),
 ]
 
 

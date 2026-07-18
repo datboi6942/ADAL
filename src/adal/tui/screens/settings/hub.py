@@ -41,6 +41,8 @@ class SettingsHubScreen(Screen):
          "Per-token LLM cost tracking"),
         ("\U0001f527  Advanced", "advanced", "default",
          "Iterations, sandbox, memory tuning, search tuning"),
+        ("\U0001f9e0  Cognitive Telemetry", "telemetry", "primary",
+         "Meta-debugger observer, anti-pattern detection"),
     ]
 
     def compose(self) -> ComposeResult:

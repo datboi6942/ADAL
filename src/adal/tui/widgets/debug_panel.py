@@ -2,6 +2,8 @@ from textual.containers import Vertical
 from textual.message import Message
 from textual.widgets import RichLog, Static
 
+from adal.constants import VERBOSITY_HIGH, VERBOSITY_LOW, VERBOSITY_MED
+
 CATEGORY_COLORS = {
     "planner": "bright_cyan",
     "proposer": "bright_magenta",
@@ -14,11 +16,8 @@ CATEGORY_COLORS = {
     "restore": "bright_green",
     "usage": "bright_cyan",
     "db": "dim",
+    "telemetry": "bright_magenta",
 }
-
-VERBOSITY_LOW = 0
-VERBOSITY_MED = 1
-VERBOSITY_HIGH = 2
 
 _TIER_NAMES = {VERBOSITY_LOW: "LOW", VERBOSITY_MED: "MED", VERBOSITY_HIGH: "HIGH"}
 
