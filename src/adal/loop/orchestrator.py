@@ -145,20 +145,12 @@ class Orchestrator:
         logger.info("orchestrator_start", session_id=session_id, query=query)
         await self._dispatch_debug("fsm", "start", f"Session {session_id[:8]} query: {query[:200]}")
 
-        live_state = display_kwargs.get("_live_state")
-        live_refresh = display_kwargs.get("_live_refresh")
 
-        def _refresh():
-            if live_refresh:
-                live_refresh()
 
         global_lessons = await self.memory_store.query_global_lessons(query)
         if global_lessons:
             logger.info("global_lessons_found", count=len(global_lessons))
 
-        if live_state:
-            live_state.reasoning_agent = "PLANNER"
-            live_state.reasoning_text = f"Classifying: {query[:500]}"
         await self._display_step("planner", "thinking", "Classifying domain...")
 
         state = LoopState(session_id=session_id, query=query, domain=Domain.UNKNOWN)
@@ -179,12 +171,6 @@ class Orchestrator:
 
         domain = _safe_domain(initial_plan.get("domain_classification", "unknown"))
         plan_usage = self._capture_usage(self.planner)
-        if live_state:
-            live_state.domain = domain.value.upper()
-            if self.planner.last_reasoning:
-                live_state.reasoning_agent = "PLANNER"
-                live_state.reasoning_text = self.planner.last_reasoning
-                _refresh()
         await self._display_reasoning("PLANNER", self.planner.last_reasoning, verbosity=VERBOSITY_MED)
         initial_reasoning = self.planner.last_reasoning
         reasoning_tag = _reasoning_tag(self.planner.last_reasoning)
@@ -199,8 +185,6 @@ class Orchestrator:
         await self._dispatch_debug("usage", "planner",
             f"PLANNER call: {plan_usage.get('total_tokens', 0)} tokens, ${cost:.5f}, {elapsed:.0f}s elapsed",
             verbosity=VERBOSITY_MED)
-        if live_state:
-            live_state.token_info = _token_bar(plan_usage)
 
         state = LoopState(
             session_id=session_id,
@@ -230,16 +214,14 @@ class Orchestrator:
 
         while state.iteration < settings.max_iterations:
             state.iteration += 1
+            proposer_crash_streak = 0
+            invalid_action_streak = 0
             revision_attempted = False
-            if live_state:
-                live_state.iteration = state.iteration
-                _refresh()
+            proposer_crash_streak = 0
+            invalid_action_streak = 0
             logger.info("iteration_start", iteration=state.iteration, session_id=session_id)
             await self._dispatch_debug("fsm", "iteration", f"Iter {state.iteration}/{settings.max_iterations}  domain={state.domain.value}  failures={len(state.prior_failures)}  validated={len(state.validated_results)}")
 
-            if live_state:
-                live_state.reasoning_agent = "PROPOSER"
-                live_state.reasoning_text = f"Directive: {current_directive[:500]}"
             await self._display_step("proposer", "thinking", "Generating hypothesis...")
             try:
                 proposal = await self._run_with_heartbeat("proposer", self.proposer.propose(
@@ -254,19 +236,23 @@ class Orchestrator:
                 state.prior_failures.append({
                     "iteration": state.iteration,
                     "hypothesis_summary": f"Proposer crashed: {e}",
+                    "fatal_flaws": [f"Proposer crashed: {type(e).__name__}"],
                     "reason": f"Proposer error: {e}",
                 })
+                proposer_crash_streak += 1
+                if proposer_crash_streak >= 3:
+                    logger.error("proposer_crash_streak_limit", streak=proposer_crash_streak)
+                    state.status = SessionStatus.FAILED
+                    await self._update_session(state)
+                    return await self._finalize(state)
                 current_directive = f"Previous proposer attempt failed with error: {e}. Try a different approach."
                 await self._update_session(state)
                 await self._dispatch_debug("db", "session_update",
                     f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
                 continue
 
+            proposer_crash_streak = 0
             prop_usage = self._capture_usage(self.proposer)
-            if live_state and self.proposer.last_reasoning:
-                live_state.reasoning_agent = "PROPOSER"
-                live_state.reasoning_text = self.proposer.last_reasoning
-                _refresh()
             await self._display_reasoning("PROPOSER", self.proposer.last_reasoning, verbosity=VERBOSITY_MED)
             if self.proposer.last_reasoning:
                 state.reasoning_log.append({"agent": "PROPOSER", "iteration": state.iteration, "text": self.proposer.last_reasoning})
@@ -282,9 +268,6 @@ class Orchestrator:
             await self._dispatch_debug("usage", "proposer",
                 f"PROPOSER call: {prop_usage.get('total_tokens', 0)} tokens, ${cost:.5f}, {elapsed:.0f}s elapsed",
                 verbosity=VERBOSITY_MED)
-            if live_state:
-                live_state.token_info = _status_bar(state.total_usage, state.started_at)
-                _refresh()
 
             script_ok = proposal.get("execution_result", {}).get("success", False)
             exe = proposal.get("execution_result", {})
@@ -356,9 +339,6 @@ class Orchestrator:
                 "execution": str(proposal.get("execution_result", {}))[:2000],
             })
 
-            if live_state:
-                live_state.reasoning_agent = "VERIFIER"
-                live_state.reasoning_text = f"Validating: {hypothesis_statement[:500]}"
             await self._display_step("verifier", "thinking", "Validating hypothesis...")
             try:
                 verdict = await self._run_with_heartbeat("verifier", self.verifier.verify(
@@ -382,10 +362,6 @@ class Orchestrator:
                 }
 
             verif_usage = self._capture_usage(self.verifier)
-            if live_state and self.verifier.last_reasoning:
-                live_state.reasoning_agent = "VERIFIER"
-                live_state.reasoning_text = self.verifier.last_reasoning
-                _refresh()
             await self._display_reasoning("VERIFIER", self.verifier.last_reasoning, verbosity=VERBOSITY_MED)
             if self.verifier.last_reasoning:
                 state.reasoning_log.append({"agent": "VERIFIER", "iteration": state.iteration, "text": self.verifier.last_reasoning})
@@ -420,9 +396,6 @@ class Orchestrator:
             await self._dispatch_debug("usage", "verifier",
                 f"VERIFIER call: {verif_usage.get('total_tokens', 0)} tokens, ${cost:.5f}, {elapsed:.0f}s elapsed",
                 verbosity=VERBOSITY_MED)
-            if live_state:
-                live_state.token_info = _status_bar(state.total_usage, state.started_at)
-                _refresh()
 
             fatal_count = len(verdict_data.get("fatal_flaws", []))
             flaws_list = verdict_data.get("fatal_flaws", [])
@@ -550,8 +523,6 @@ class Orchestrator:
                     await self._dispatch_debug("fsm", "forced_pivot",
                         f"3+ consecutive failures share: {', '.join(common)[:200]}  — SKIPPING planner, forcing PIVOT")
                     state.data_context += f"\n\n[SYSTEM: 3+ consecutive failures share flaws: {', '.join(common)}. Force PIVOT.]"
-                    if live_state:
-                        live_state.reasoning_text = "⚠ 3+ consecutive identical failures detected — forcing diversification"
                     current_directive = f"PIVOT REQUIRED: The last 3 approaches failed with the same flaws: {', '.join(common)}. Propose a fundamentally different approach — do NOT refine the previous method."
                     continue
                 else:
@@ -635,9 +606,6 @@ class Orchestrator:
                             InteractionDirection.VERIFIER_TO_PLANNER, hypothesis_db.id,
                         )
                         await self._display_step("proposer", "done", "Revision accepted — hypothesis now passes!")
-                        if live_state:
-                            live_state.token_info = _status_bar(state.total_usage, state.started_at)
-                            _refresh()
                     else:
                         logger.info("revision_rejected", iteration=state.iteration)
                         await self._display_step("proposer", "done", "Revision did not resolve all issues")
@@ -645,9 +613,6 @@ class Orchestrator:
                     logger.info("revision_attempt_failed", error=str(e))
                     await self._display_step("proposer", "error", f"Revision crashed: {e}")
 
-            if live_state:
-                live_state.reasoning_agent = "PLANNER"
-                live_state.reasoning_text = f"Deciding next action for: {verdict_data['verdict']} ({verdict_data['confidence']:.0%})"
             await self._display_step("decision", "thinking", "Evaluating next action...")
             try:
                 planner_decision = await self._run_with_heartbeat("planner", self.planner.plan(
@@ -667,19 +632,35 @@ class Orchestrator:
                     hypotheses_history=state.hypotheses[-3:],
                 ))
             except Exception as e:
-                logger.error("planner_decision_failed", error=str(e))
-                await self._display_step("decision", "error", str(e)[:80])
-                planner_decision = {
-                    "action": "fail",
-                    "directive_to_proposer": current_directive,
-                    "reasoning": f"Planner crashed: {e}",
-                }
+                logger.warning("planner_decision_failed_first", error=str(e))
+                await self._display_step("decision", "error", f"Planner error: {str(e)[:80]} — retrying...")
+                try:
+                    planner_decision = await self._run_with_heartbeat("planner_retry", self.planner.plan(
+                        user_query=query,
+                        state={
+                            "session_id": state.session_id,
+                            "iteration": state.iteration,
+                            "domain": state.domain.value,
+                            "status": state.status.value,
+                            "proposer_summary": proposal.get("analysis_summary", "")[:500],
+                            "sandbox_success": proposal.get("execution_result", {}).get("success", False),
+                            "sandbox_stdout": (proposal.get("execution_result", {}).get("stdout", "") or "")[:1500],
+                               "prior_failures_count": len(state.prior_failures),
+                            "validated_count": len(state.validated_results),
+                        },
+                        verdict=verdict_data,
+                        hypotheses_history=state.hypotheses[-3:],
+                    ))
+                except Exception as e2:
+                    logger.error("planner_decision_failed_retry", error=str(e2))
+                    await self._display_step("decision", "error", f"Planner error after retry: {str(e2)[:80]}")
+                    planner_decision = {
+                        "action": "fail",
+                        "directive_to_proposer": current_directive,
+                        "reasoning": f"Planner crashed twice: {str(e)[:100]}, {str(e2)[:100]}",
+                    }
 
             dec_usage = self._capture_usage(self.planner)
-            if live_state and self.planner.last_reasoning:
-                live_state.reasoning_agent = "PLANNER"
-                live_state.reasoning_text = self.planner.last_reasoning
-                _refresh()
             await self._display_reasoning("PLANNER", self.planner.last_reasoning, verbosity=VERBOSITY_MED)
             if self.planner.last_reasoning:
                 state.reasoning_log.append({"agent": "PLANNER", "iteration": state.iteration, "text": self.planner.last_reasoning})
@@ -688,9 +669,15 @@ class Orchestrator:
             action_raw = planner_decision.get("action", "continue")
             try:
                 action = PlannerAction(action_raw.lower())
+                invalid_action_streak = 0
             except ValueError:
-                logger.warning("planner_invalid_action", raw=action_raw)
-                action = PlannerAction.CONTINUE
+                logger.warning("planner_invalid_action", raw=action_raw, streak=invalid_action_streak + 1)
+                invalid_action_streak += 1
+                if invalid_action_streak >= 3:
+                    logger.error("planner_invalid_action_limit", streak=invalid_action_streak)
+                    action = PlannerAction.FAIL
+                else:
+                    action = PlannerAction.CONTINUE
             directive = planner_decision.get("directive_to_proposer", current_directive)
             reason = planner_decision.get("reasoning", "")
 
@@ -731,9 +718,6 @@ class Orchestrator:
             await self._dispatch_debug("usage", "planner",
                 f"PLANNER call: {dec_usage.get('total_tokens', 0)} tokens, ${cost:.5f}, {elapsed:.0f}s elapsed",
                 verbosity=VERBOSITY_MED)
-            if live_state:
-                live_state.token_info = _status_bar(state.total_usage, state.started_at)
-                _refresh()
 
             cost_total = _calculate_cost(state.total_usage)["total_cost"]
             logger.info(
@@ -848,12 +832,14 @@ class Orchestrator:
             "cost": _calculate_cost(_empty_usage()),
         }
 
-    async def run_restore(self, query: str | None = None, **display_kwargs) -> dict:
-        session_id, state = await self._load_most_recent_session()
+    async def run_restore(self, query: str | None = None, *, state: LoopState | None = None, **display_kwargs) -> dict:
+        if state:
+            session_id = state.session_id
+        else:
+            session_id, state = await self._load_most_recent_session()
         if session_id is None:
             return self._build_error_result("", query or "", "No restorable sessions found")
 
-        self._wire_live_state(display_kwargs)
         await self._wire_memory(session_id)
 
         logger.info("restore_start", session_id=session_id, iteration=state.iteration, domain=state.domain.value)
@@ -862,10 +848,6 @@ class Orchestrator:
 
         while state.iteration < settings.max_iterations:
             state.iteration += 1
-            live_state = display_kwargs.get("_live_state")
-            if live_state:
-                live_state.iteration = state.iteration
-                live_state.domain = state.domain.value.upper()
 
             await self._display_step("planner", "thinking", "Evaluating restored state...")
             await self._display_step("planner", "done",
@@ -958,27 +940,14 @@ class Orchestrator:
         return session.id, state
 
     async def _run_loop(self, session_id: str, state: LoopState, current_directive: str, display_kwargs: dict) -> dict:
-        self._wire_live_state(display_kwargs)
         await self._wire_memory(session_id)
-        live_state = display_kwargs.get("_live_state")
-        live_refresh = display_kwargs.get("_live_refresh")
 
-        def _refresh():
-            if live_refresh:
-                live_refresh()
 
         while state.iteration < settings.max_iterations:
             state.iteration += 1
-            if live_state:
-                live_state.iteration = state.iteration
-                live_state.domain = state.domain.value.upper()
-                _refresh()
 
             logger.info("iteration_start", iteration=state.iteration, session_id=session_id)
 
-            if live_state:
-                live_state.reasoning_agent = "PROPOSER"
-                live_state.reasoning_text = f"Directive: {current_directive[:500]}"
             await self._display_step("proposer", "thinking", "Generating hypothesis...")
             try:
                 proposal = await self._run_with_heartbeat("proposer", self.proposer.propose(
@@ -998,10 +967,6 @@ class Orchestrator:
                 continue
 
             prop_usage = self._capture_usage(self.proposer)
-            if live_state and self.proposer.last_reasoning:
-                live_state.reasoning_agent = "PROPOSER"
-                live_state.reasoning_text = self.proposer.last_reasoning
-                _refresh()
             await self._display_reasoning("PROPOSER", self.proposer.last_reasoning, verbosity=VERBOSITY_MED)
             if self.proposer.last_reasoning:
                 state.reasoning_log.append({"agent": "PROPOSER", "iteration": state.iteration, "text": self.proposer.last_reasoning})
@@ -1023,9 +988,6 @@ class Orchestrator:
                 memory_type="episodic",
                 iteration_turn=state.iteration,
             )
-            if live_state:
-                live_state.token_info = _status_bar(state.total_usage, state.started_at)
-                _refresh()
 
             # Short-circuit: rest goes through existing methods would be duplication.
             # Instead, persist and loop as normal.
@@ -1045,9 +1007,6 @@ class Orchestrator:
 
             analysis_context = json.dumps({"summary": proposal.get("analysis_summary", ""), "features": proposal.get("features_detected", []), "execution": str(proposal.get("execution_result", {}))[:2000]})
 
-            if live_state:
-                live_state.reasoning_agent = "VERIFIER"
-                live_state.reasoning_text = f"Validating: {hypothesis_statement[:500]}"
             await self._display_step("verifier", "thinking", "Validating hypothesis...")
             try:
                 verdict = await self._run_with_heartbeat("verifier", self.verifier.verify(hypothesis=hyp, analysis_context=analysis_context, domain=state.domain.value, prior_failures=state.prior_failures))
@@ -1056,10 +1015,6 @@ class Orchestrator:
                 verdict = {"verdict": "FAIL", "confidence": 0.0, "fatal_flaws": [f"Verifier crashed: {e}"], "checks_performed": [], "suggestions": []}
 
             verif_usage = self._capture_usage(self.verifier)
-            if live_state and self.verifier.last_reasoning:
-                live_state.reasoning_agent = "VERIFIER"
-                live_state.reasoning_text = self.verifier.last_reasoning
-                _refresh()
             await self._display_reasoning("VERIFIER", self.verifier.last_reasoning, verbosity=VERBOSITY_MED)
             if self.verifier.last_reasoning:
                 state.reasoning_log.append({"agent": "VERIFIER", "iteration": state.iteration, "text": self.verifier.last_reasoning})
@@ -1085,9 +1040,6 @@ class Orchestrator:
             await self._dispatch_debug("usage", "verifier",
                 f"VERIFIER call: {verif_usage.get('total_tokens', 0)} tokens, ${cost:.5f}, {elapsed:.0f}s elapsed",
                 verbosity=VERBOSITY_MED)
-            if live_state:
-                live_state.token_info = _status_bar(state.total_usage, state.started_at)
-                _refresh()
 
             await self._persist_validation(hypothesis_db.id, verdict_data["verdict"] == "PASS", verdict_data["confidence"], verdict_data)
             verdict["_reasoning"] = self.verifier.last_reasoning
@@ -1133,21 +1085,36 @@ class Orchestrator:
 
             await self._update_hypothesis_db(hypothesis_db)
 
-            if live_state:
-                live_state.reasoning_agent = "PLANNER"
-                live_state.reasoning_text = f"Deciding next action for: {verdict_data['verdict']} ({verdict_data['confidence']:.0%})"
+            if len(state.prior_failures) >= 3:
+                last_three_flaws = [
+                    set(pf.get("fatal_flaws", []))
+                    for pf in state.prior_failures[-3:]
+                ]
+                common = last_three_flaws[0] & last_three_flaws[1] & last_three_flaws[2]
+                if common:
+                    logger.warning("consecutive_identical_flaws_restore", common=list(common))
+                    await self._dispatch_debug("fsm", "forced_pivot",
+                        f"3+ consecutive failures share: {', '.join(common)[:200]}  — SKIPPING planner, forcing PIVOT")
+                    state.data_context += f"\n\n[SYSTEM: 3+ consecutive failures share flaws: {', '.join(common)}. Force PIVOT.]"
+                    current_directive = f"PIVOT REQUIRED: The last 3 approaches failed with the same flaws: {', '.join(common)}. Propose a fundamentally different approach — do NOT refine the previous method."
+                    await self._update_session(state)
+                    continue
+
+
             await self._display_step("decision", "thinking", "Evaluating next action...")
             try:
                 planner_decision = await self._run_with_heartbeat("planner", self.planner.plan(user_query=state.query, state={"session_id": session_id, "iteration": state.iteration, "domain": state.domain.value, "status": state.status.value, "proposer_summary": proposal.get("analysis_summary", "")[:500], "sandbox_success": proposal.get("execution_result", {}).get("success", False), "sandbox_stdout": (proposal.get("execution_result", {}).get("stdout", "") or "")[:1500], "prior_failures_count": len(state.prior_failures), "validated_count": len(state.validated_results)}, verdict=verdict_data, hypotheses_history=state.hypotheses[-3:]))
             except Exception as e:
-                logger.error("planner_decision_failed", error=str(e))
-                planner_decision = {"action": "fail", "directive_to_proposer": current_directive, "reasoning": f"Planner crashed: {e}"}
+                logger.warning("planner_decision_failed_first", error=str(e))
+                await self._display_step("decision", "error", f"Planner error: {str(e)[:80]} — retrying...")
+                try:
+                    planner_decision = await self._run_with_heartbeat("planner_retry", self.planner.plan(user_query=state.query, state={"session_id": session_id, "iteration": state.iteration, "domain": state.domain.value, "status": state.status.value, "proposer_summary": proposal.get("analysis_summary", "")[:500], "sandbox_success": proposal.get("execution_result", {}).get("success", False), "sandbox_stdout": (proposal.get("execution_result", {}).get("stdout", "") or "")[:1500], "prior_failures_count": len(state.prior_failures), "validated_count": len(state.validated_results)}, verdict=verdict_data, hypotheses_history=state.hypotheses[-3:]))
+                except Exception as e2:
+                    logger.error("planner_decision_failed_retry", error=str(e2))
+                    await self._display_step("decision", "error", f"Planner error after retry: {str(e2)[:80]}")
+                    planner_decision = {"action": "fail", "directive_to_proposer": current_directive, "reasoning": f"Planner crashed twice: {str(e)[:100]}, {str(e2)[:100]}"}
 
             dec_usage = self._capture_usage(self.planner)
-            if live_state and self.planner.last_reasoning:
-                live_state.reasoning_agent = "PLANNER"
-                live_state.reasoning_text = self.planner.last_reasoning
-                _refresh()
             await self._display_reasoning("PLANNER", self.planner.last_reasoning, verbosity=VERBOSITY_MED)
             if self.planner.last_reasoning:
                 state.reasoning_log.append({"agent": "PLANNER", "iteration": state.iteration, "text": self.planner.last_reasoning})
@@ -1156,9 +1123,15 @@ class Orchestrator:
             action_raw = planner_decision.get("action", "continue")
             try:
                 action = PlannerAction(action_raw.lower())
+                invalid_action_streak = 0
             except ValueError:
-                logger.warning("planner_invalid_action", raw=action_raw)
-                action = PlannerAction.CONTINUE
+                logger.warning("planner_invalid_action", raw=action_raw, streak=invalid_action_streak + 1)
+                invalid_action_streak += 1
+                if invalid_action_streak >= 3:
+                    logger.error("planner_invalid_action_limit", streak=invalid_action_streak)
+                    action = PlannerAction.FAIL
+                else:
+                    action = PlannerAction.CONTINUE
             directive = planner_decision.get("directive_to_proposer", current_directive)
             reason = planner_decision.get("reasoning", "")
 
@@ -1186,9 +1159,6 @@ class Orchestrator:
                 f"Planner → {action.value.upper()}  reason: {reason[:200]}")
             await self._dispatch_debug("planner", "directive",
                 f"Next directive: {directive[:400]}", verbosity=VERBOSITY_MED)
-            if live_state:
-                live_state.token_info = _status_bar(state.total_usage, state.started_at)
-                _refresh()
 
             cost_total = _calculate_cost(state.total_usage)["total_cost"]
             logger.info("planner_decision", iteration=state.iteration, action=action.value, directive=directive[:200], reason=reason[:200], usage_prompt=dec_usage["prompt_tokens"], usage_completion=dec_usage["completion_tokens"])
@@ -1230,11 +1200,6 @@ class Orchestrator:
             agent.current_session_id = session_id
             agent._search_cache = shared_cache
 
-    def _wire_live_state(self, display_kwargs: dict):
-        live_state = display_kwargs.get("_live_state")
-        if live_state:
-            live_state.domain = "loading..."
-            live_state.iteration = 0
 
     async def _persist_session(self, state: LoopState):
         sessionmaker = get_sessionmaker()

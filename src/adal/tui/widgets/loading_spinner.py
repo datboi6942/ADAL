@@ -9,6 +9,13 @@ AGENT_ICONS = {
     "": "\u269b",
 }
 
+AGENT_LABELS = {
+    "planner": "PLANNER",
+    "proposer": "PROPOSER",
+    "verifier": "VERIFIER",
+    "decision": "DECISION",
+}
+
 AGENT_COLORS = {
     "planner": "cyan",
     "proposer": "bright_magenta",

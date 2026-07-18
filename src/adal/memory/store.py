@@ -5,8 +5,8 @@ import pyarrow as pa
 import structlog
 
 from adal.config import settings
+from adal.constants import VERBOSITY_HIGH, VERBOSITY_MED
 from adal.memory.embedder import get_embedding
-from adal.tui.widgets.debug_panel import VERBOSITY_HIGH, VERBOSITY_MED
 
 logger = structlog.get_logger(__name__)
 
@@ -207,7 +207,7 @@ class MemoryStore:
             vector = await get_embedding(query_text)
             vector_f = [float(v) for v in vector]
 
-            fetch_n = max(10, max_results * 3)
+            fetch_n = max(10, max_results * settings.memory_query_oversample_factor)
             results = (
                 self._table.search(vector_f)
                 .where(f"session_id == '{session_id}' AND memory_type == 'episodic'")
@@ -221,8 +221,8 @@ class MemoryStore:
 
             await self._load_failure_vectors(session_id)
 
+            scored = []
             if self._failure_vectors:
-                survivors = []
                 for r in results:
                     r_vec = r.get("vector", [])
                     max_sim = 0.0
@@ -230,15 +230,12 @@ class MemoryStore:
                         sim = self._cosine_similarity(r_vec, fail_vec)
                         if sim > max_sim:
                             max_sim = sim
-                    if max_sim < prune_threshold:
-                        survivors.append(r["text"])
-                    else:
-                        logger.debug(
-                            "memory_pruned",
-                            text_preview=r["text"][:80],
-                            max_similarity=round(max_sim, 3),
-                            threshold=prune_threshold,
-                        )
+                    scored.append((r, max_sim))
+
+                survivors = [
+                    r["text"] for r, max_sim in scored
+                    if max_sim < prune_threshold
+                ]
                 texts = survivors[:max_results]
             else:
                 texts = [r["text"] for r in results[:max_results]]
@@ -247,13 +244,7 @@ class MemoryStore:
             if self._debug_callback and pruned_count > 0:
                 await self._debug_callback("memory", "prune",
                     f"Chaff pruned {pruned_count} of {len(results)} candidates (threshold={prune_threshold})", verbosity=VERBOSITY_MED)
-                for r in results:
-                    r_vec = r.get("vector", [])
-                    max_sim = 0.0
-                    for fail_vec in self._failure_vectors:
-                        sim = self._cosine_similarity(r_vec, fail_vec)
-                        if sim > max_sim:
-                            max_sim = sim
+                for r, max_sim in scored:
                     if max_sim >= prune_threshold:
                         await self._debug_callback("memory", "prune_detail",
                             f"Pruned: {r['text'][:100]} (max similarity={max_sim:.3f})", verbosity=VERBOSITY_HIGH)

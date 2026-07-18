@@ -1,5 +1,4 @@
 import asyncio
-import random
 import time
 
 from textual.binding import Binding
@@ -7,6 +6,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Button, Footer, RichLog, Static
 
+from adal.config import settings
 from adal.tui.db_queries import get_hypotheses, get_interactions, get_session, get_validation_results
 from adal.tui.widgets.chat_history import ChatHistory, IterationCard
 from adal.tui.widgets.debug_panel import (
@@ -16,17 +16,15 @@ from adal.tui.widgets.debug_panel import (
     DebugLine,
     DebugPanel,
 )
-from adal.tui.widgets.loading_spinner import AGENT_ICONS, BAR_WIDTH, GRADIENT, SPARKLE_CHARS
 from adal.tui.widgets.query_input import CommandInput, CommandSubmit, QuerySubmit
+from adal.tui.widgets.status_animatable import StatusAnimatableMixin
 from adal.tui.widgets.suggestion_list import SuggestionList
 from adal.tui.worker import OrcWorker, ReasoningUpdate, ResultReady, StatusUpdate
-
-AGENT_LABELS = {"planner": "PLANNER", "proposer": "PROPOSER", "verifier": "VERIFIER", "decision": "DECISION"}
 
 STATUS_ICONS = {"verified": "\u2713", "rejected": "\u2717", "proposed": "\u00b7", "validating": "\u23f3", "superseded": "~"}
 
 
-class SessionDetailScreen(Screen):
+class SessionDetailScreen(Screen, StatusAnimatableMixin):
     COMPONENT_CLASSES = {"input"}
 
     BINDINGS = [
@@ -68,87 +66,7 @@ class SessionDetailScreen(Screen):
         self._update_status("Loading session\u2026")
         asyncio.create_task(self._load_session())
 
-    def _update_status(self, text: str):
-        self.query_one("#status-text", Static).update(f"[dim]{text}[/dim]")
-
-    def _start_status_animation(self):
-        self._tick_count = 0
-        self._ticking = True
-        if self._status_timer is None:
-            self._status_timer = self.set_timer(0.15, self._status_tick)
-
-    def _stop_status_animation(self):
-        self._ticking = False
-        if self._status_timer:
-            self._status_timer.stop()
-            self._status_timer = None
-
-    def _status_tick(self):
-        try:
-            self._tick_count += 1
-            elapsed = int(time.time() - self._start_time) if self._start_time > 0 else 0
-            m, s = divmod(max(elapsed, 0), 60)
-            agent_key = self._current_agent or ""
-
-            icon = AGENT_ICONS.get(agent_key, "\u269b")
-            pulse_val = ((self._tick_count // 2) % 16) - 8
-            if pulse_val < 0:
-                icon = f"[dim]{icon}[/dim]"
-            elif pulse_val > 0:
-                icon = f"[bold]{icon}[/bold]"
-
-            fill_pct = self._iter / self._max_iters if self._max_iters > 0 else 0
-            filled = int(fill_pct * BAR_WIDTH)
-
-            bar_chars = []
-            for i in range(BAR_WIDTH):
-                wave_dist = (i - (self._tick_count % BAR_WIDTH)) % BAR_WIDTH
-                if wave_dist < BAR_WIDTH // 2:
-                    wave_bright = wave_dist / (BAR_WIDTH // 2)
-                else:
-                    wave_bright = (BAR_WIDTH - wave_dist) / (BAR_WIDTH // 2)
-                if i < filled:
-                    color_idx = (i + self._tick_count // 6) % len(GRADIENT)
-                    bar_chars.append(f"[{GRADIENT[color_idx]}]\u2588[/{GRADIENT[color_idx]}]")
-                elif i == filled:
-                    color_idx = (i + self._tick_count // 6) % len(GRADIENT)
-                    bar_chars.append(f"[{GRADIENT[color_idx]}]\u2593[/{GRADIENT[color_idx]}]")
-                elif i == filled + 1:
-                    bar_chars.append("[dim]\u2591[/dim]")
-                else:
-                    if random.random() < wave_bright * 0.08:
-                        bar_chars.append("[dim]\u2592[/dim]")
-                    else:
-                        bar_chars.append("[dim]\u2591[/dim]")
-
-            sparkle = " "
-            if filled < BAR_WIDTH and random.random() < 0.12:
-                sparkle_char = random.choice(SPARKLE_CHARS)
-                col = GRADIENT[(filled + self._tick_count // 6) % len(GRADIENT)]
-                sparkle = f"[{col}]{sparkle_char}[/{col}]"
-
-            bar = "".join(bar_chars)
-            agent_label = AGENT_LABELS.get(agent_key, "")
-            agent_icon = AGENT_ICONS.get(agent_key, "\u269b")
-            if agent_label:
-                label = f"[bold]{agent_icon} {agent_label}[/bold]"
-            else:
-                label = f"[dim]{agent_icon} Continuing[/dim]"
-
-            line = (
-                f"{icon} {bar} {sparkle} "
-                f"[bold]{self._iter}/{self._max_iters}[/bold] "
-                f"{m}:{s:02d}  {label}"
-            )
-            self.query_one("#status-text", Static).update(line)
-        except Exception:
-            t = int(time.time() - self._start_time) if self._start_time > 0 else 0
-            m, s = divmod(t, 60)
-            self.query_one("#status-text", Static).update(
-                f"Iter {self._iter}/{self._max_iters}  {m}:{s:02d}"
-            )
-        if self._ticking:
-            self._status_timer = self.set_timer(0.15, self._status_tick)
+    _status_label_fallback = "Continuing"
 
     async def _load_session(self):
         session = await get_session(self._session_id)
@@ -523,6 +441,23 @@ class SessionDetailScreen(Screen):
             self.notify("Session detail loaded — see above", title="Status")
         elif cmd_name == "/clear":
             self.notify("Clear not available in session view", title="Clear")
+        elif cmd_name == "/telemetry":
+            args_str = str(args).strip().lower()
+            if args_str in ("on", "1", "true", "enable"):
+                settings.telemetry_enabled = True
+                if self._worker and self._worker.orc:
+                    self._worker.orc.set_telemetry(True)
+                self.notify("Cognitive telemetry enabled", title="Telemetry")
+            elif args_str in ("off", "0", "false", "disable"):
+                settings.telemetry_enabled = False
+                if self._worker and self._worker.orc:
+                    self._worker.orc.set_telemetry(False)
+                self.notify("Cognitive telemetry disabled", title="Telemetry")
+            else:
+                status = "ON" if settings.telemetry_enabled else "OFF"
+                self.notify(f"Cognitive telemetry: {status}\nUsage: /telemetry [on/off]", title="Telemetry")
+        elif cmd_name == "/diagnostics":
+            self.app.push_telemetry_dashboard()
         else:
             self.notify(f"Unknown command: {cmd_name}. Type /help for available commands.", title="Command", severity="warning")
 

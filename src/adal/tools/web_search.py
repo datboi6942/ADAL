@@ -5,6 +5,7 @@ import json
 import random
 import re
 import time as _time
+from collections import OrderedDict
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlparse
 from urllib.parse import urlparse as _urlparse
@@ -17,8 +18,21 @@ from adal.config import settings
 logger = structlog.get_logger(__name__)
 
 _last_request_time: float = 0.0
-_query_cache: dict[str, str] = {}
+_query_cache: OrderedDict[str, str] = OrderedDict()
+_fetch_cache: OrderedDict[str, str] = OrderedDict()
+_CACHE_MAX_SIZE = 500
 _after_rate_limit: bool = False
+
+
+def _cache_put(cache: dict, key: str, value: str) -> None:
+    if isinstance(cache, OrderedDict):
+        if key in cache:
+            cache.move_to_end(key)
+            cache[key] = value
+            return
+        if len(cache) >= _CACHE_MAX_SIZE:
+            cache.popitem(last=False)
+    cache[key] = value
 _search_lock = asyncio.Lock()
 
 
@@ -89,13 +103,13 @@ async def async_search_web(query: str, max_results: int | None = None, _cache: d
             for attempt in range(settings.search_max_retries):
                 try:
                     ua = random.choice(USER_AGENTS)
-                    _last_request_time = _time.time()
                     resp = await client.get(
                         "https://html.duckduckgo.com/html/",
                         params={"q": query},
                         headers={"User-Agent": ua},
                         follow_redirects=True,
                     )
+                    _last_request_time = _time.time()
                     if resp.status_code in (202, 429):
                         _after_rate_limit = True
                         wait = 2 ** attempt
@@ -117,17 +131,18 @@ async def async_search_web(query: str, max_results: int | None = None, _cache: d
                     for r in results:
                         r["url"] = _clean_ddg_url(r["url"])
                     result = json.dumps({"query": query, "results": results, "source": "duckduckgo"}, ensure_ascii=False)
-                    cache[cache_key] = result
+                    if results:
+                        _cache_put(cache, cache_key, result)
                     _after_rate_limit = False
                     return result
 
                 except httpx.TimeoutException:
-                    if attempt < 2:
+                    if attempt < settings.search_max_retries - 1:
                         logger.info("web_search_timeout_retry", attempt=attempt)
                         await asyncio.sleep(2 ** attempt)
                         continue
                 except Exception as e:
-                    if attempt < 2:
+                    if attempt < settings.search_max_retries - 1:
                         logger.info("web_search_error_retry", attempt=attempt, error=str(e))
                         await asyncio.sleep(2 ** attempt)
                         continue
@@ -135,10 +150,10 @@ async def async_search_web(query: str, max_results: int | None = None, _cache: d
                     break
 
             logger.info("web_search_fallback", provider="wikipedia", query=query[:100])
-            return await _wikipedia_search(query, max_results)
+            return await _wikipedia_search(query, max_results, _cache=cache, cache_key=cache_key)
 
 
-async def _wikipedia_search(query: str, max_results: int | None = None) -> str:
+async def _wikipedia_search(query: str, max_results: int | None = None, _cache: dict | None = None, cache_key: str | None = None) -> str:
     if max_results is None:
         max_results = settings.search_max_results
     try:
@@ -169,7 +184,10 @@ async def _wikipedia_search(query: str, max_results: int | None = None) -> str:
                         "url": url,
                         "snippet": f"Wikipedia article: {title}",
                     })
-            return json.dumps({"query": query, "results": results, "source": "fallback:wikipedia"}, ensure_ascii=False)
+            result = json.dumps({"query": query, "results": results, "source": "fallback:wikipedia"}, ensure_ascii=False)
+            if _cache is not None and cache_key and results:
+                _cache_put(_cache, cache_key, result)
+            return result
 
     except Exception as e:
         logger.error("wikipedia_fallback_failed", error=str(e))
@@ -184,9 +202,12 @@ async def async_fetch_url(url: str, max_chars: int | None = None, _cache: dict |
     logger.info("web_fetch", url=url[:100])
 
     if _cache is not None:
-        cache_key = url
-        if cache_key in _cache:
-            return _cache[cache_key]
+        effective_cache = _cache
+    else:
+        effective_cache = _fetch_cache
+    cache_key = url
+    if cache_key in effective_cache:
+        return effective_cache[cache_key]
 
     host = _urlparse(url).hostname or ""
     if host in _get_blocked_hosts():
@@ -212,7 +233,9 @@ async def async_fetch_url(url: str, max_chars: int | None = None, _cache: dict |
                     await asyncio.sleep(wait)
                     continue
                 if resp.status_code != 200:
-                    return json.dumps({"error": f"Fetch failed: HTTP {resp.status_code}", "url": url})
+                    result = json.dumps({"error": f"Fetch failed: HTTP {resp.status_code}", "url": url})
+                    _cache_put(effective_cache, url, result)
+                    return result
 
                 content_type = resp.headers.get("content-type", "")
                 if "text/html" in content_type:
@@ -225,18 +248,17 @@ async def async_fetch_url(url: str, max_chars: int | None = None, _cache: dict |
                     text = resp.text[:max_chars]
 
                 result = json.dumps({"url": url, "content": text, "length": len(text)}, ensure_ascii=False)
-                if _cache is not None and result:
-                    _cache[url] = result
+                _cache_put(effective_cache, url, result)
                 return result
 
         except httpx.TimeoutException:
-            if attempt < 2:
+            if attempt < settings.fetch_max_retries - 1:
                 logger.info("fetch_timeout_retry", attempt=attempt)
                 await asyncio.sleep(2 ** attempt)
                 continue
             return json.dumps({"error": "Fetch timed out after retries", "url": url})
         except Exception as e:
-            if attempt < 2:
+            if attempt < settings.fetch_max_retries - 1:
                 logger.info("fetch_error_retry", attempt=attempt, error=str(e))
                 await asyncio.sleep(2 ** attempt)
                 continue
