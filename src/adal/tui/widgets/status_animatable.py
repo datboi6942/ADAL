@@ -46,6 +46,8 @@ class StatusAnimatableMixin:
 
     def _status_tick(self) -> None:
         try:
+            if not self._ticking:
+                return
             self._tick_count += 1
             elapsed = int(time.time() - self._start_time) if self._start_time > 0 else 0
             m, s = divmod(max(elapsed, 0), 60)
@@ -103,6 +105,6 @@ class StatusAnimatableMixin:
                 f"[dim]{m:02d}:{s:02d}[/dim]"
             )
             self.query_one("#status-text", Static).update(line)
-            self.set_timer(0.15, self._status_tick)
+            self._status_timer = self.set_timer(0.15, self._status_tick)
         except Exception:
             pass

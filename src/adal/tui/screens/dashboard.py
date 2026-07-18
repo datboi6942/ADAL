@@ -248,11 +248,11 @@ class DashboardScreen(Screen, StatusAnimatableMixin):
 
         fa = result.get("final_answer", "")
         if isinstance(fa, str) and fa.strip():
-            history.add_markdown(f"## Final Answer\n{fa[:2000]}")
+            history.add_markdown(f"## Final Answer\n{fa}")
         elif isinstance(fa, dict):
             for k, v in fa.items():
                 title = k.replace("_", " ").title()
-                history.add_markdown(f"### {title}\n{str(v)[:2000]}")
+                history.add_markdown(f"### {title}\n{str(v)}")
 
         actions = VerticalScroll(classes="result-actions")
         history.mount(actions)
@@ -298,6 +298,9 @@ class DashboardScreen(Screen, StatusAnimatableMixin):
                         card._write()
 
     def _export(self):
+        asyncio.create_task(self._do_export())
+
+    async def _do_export(self):
         try:
             result = self._last_result
             if not result:
@@ -310,8 +313,16 @@ class DashboardScreen(Screen, StatusAnimatableMixin):
             elif isinstance(fa, dict):
                 for k, v in fa.items():
                     text += f"## {k.replace('_', ' ').title()}\n{str(v)}\n\n"
+
             from pathlib import Path
-            path = Path("adal_export.md")
+
+            from adal.tui.utils import generate_export_filename
+
+            content_preview = fa if isinstance(fa, str) else str(fa)
+            filename = await generate_export_filename(
+                result.get("query", ""), content_preview
+            )
+            path = Path(f"{filename}.md")
             path.write_text(text)
             self.notify(f"Exported to {path}", title="Export")
         except Exception as e:
