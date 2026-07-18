@@ -1,3 +1,4 @@
+import asyncio
 import re
 from datetime import UTC, datetime
 
@@ -9,7 +10,7 @@ async def generate_export_filename(query: str, content_preview: str) -> str:
 
     Falls back to timestamp + session ID prefix if the LLM call fails.
     """
-    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
 
     try:
         model = _resolve_sub_model()
@@ -28,12 +29,15 @@ async def generate_export_filename(query: str, content_preview: str) -> str:
             "Filename:"
         )
 
-        response = await chat_completion(
-            system_prompt=system,
-            user_message=user,
-            model=model,
-            thinking_enabled=False,
-            max_tokens=64,
+        response = await asyncio.wait_for(
+            chat_completion(
+                system_prompt=system,
+                user_message=user,
+                model=model,
+                thinking_enabled=False,
+                max_tokens=64,
+            ),
+            timeout=5.0,
         )
 
         name = response.content.strip().strip('"').strip("'").replace("\n", " ")
