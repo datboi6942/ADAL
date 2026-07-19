@@ -30,10 +30,12 @@ Domain classification is keyword-regex-based in `agents/planner.py:classify_doma
 Invalid domain strings are caught by `_safe_domain()` → defaults to `UNKNOWN`.
 
 ### Sub-Agent Model Routing
-Secondary LLM calls (self-critique, deep verification, revision, planner parse-failure
-retry) use a **cheaper sub-model** (`deepseek-v4-chat` by default) with **thinking
-disabled**. Primary calls (main propose, main verify, main plan) still use
-`deepseek-v4-pro` with `reasoning_effort="max"`.
+Complex self-reflection/correction calls (self-critique, deep verification, revision) use
+the **primary model** (`deepseek-v4-pro` by default) with **thinking enabled**
+(`reasoning_effort="max"`) for maximum intelligence — these catch subtle issues. Only
+the planner parse-failure retry uses a cheaper sub-model with thinking disabled, since
+it's a mechanical JSON re-parse. Primary calls (main propose, main verify, main plan)
+still use `deepseek-v4-pro` with `reasoning_effort="max"`.
 
 Per-call granularity: every `_think_smart(context, thinking_enabled=..., model=...)`
 call chooses model + thinking independently. Configurable per-provider in
@@ -101,8 +103,8 @@ To prevent LLM death-spirals (3-6 minute tool loops chasing dead URLs):
   `deep_verify_max_tool_turns=3`, `revise_max_tool_turns=3`. Planner initial plan uses
   `planner_initial_tool_turns=0` (no tools). All configurable via `.env` / Settings UI.
 - **Per-agent timeouts** (seconds): `planner_timeout=60`, `proposer_timeout=120`,
-  `verifier_timeout=90`, `self_critique_timeout=30`, `deep_verify_timeout=45`,
-  `revise_timeout=45`. Wall-clock bailout triggers forced final answer.
+  `verifier_timeout=90`, `self_critique_timeout=60`, `deep_verify_timeout=90`,
+  `revise_timeout=90`. Wall-clock bailout triggers forced final answer.
 - **Failed-tool short-circuit**: `_tool_failed()` in `client.py` detects errors (HTTP 403,
   timeout, PDF unreadable, search failed). After `tool_fail_streak_limit=3` consecutive
   failures, the tool loop breaks → forced final answer.
@@ -118,7 +120,7 @@ It uses `_think_smart()` with full tool access (web_search, fetch_url, calculate
 `SELF_CRITIQUE_SYSTEM_PROMPT` (separate from the Proposer's main system prompt) to prevent
 role confusion where the model thinks it's still generating hypotheses. Expanded checklist:
 stoichiometry, yield, thermodynamics, workup, equipment, precursors, math, moisture/air
-sensitivity. Runs as a sub-model call (`deepseek-v4-chat`, no thinking).
+sensitivity. Uses the primary model with full thinking enabled for maximum intelligence.
 
 Results (`confidence_adjustment`, `suggested_fix`, `issues_found`) are automatically applied
 to the hypothesis before sandbox execution — confidence is clamped to [0.0, 1.0], suggested
@@ -130,8 +132,8 @@ deep verification pass. Triggered when confidence < 0.85, verdict is PARTIAL, or
 WARNING/PARTIAL results with no fatal flaws. The deep pass uses a specialized system prompt
 (`DEEP_VERIFICATION_SYSTEM_PROMPT`) and receives only the borderline checks. Results are
 merged via `_merge_verification_results()` — upgrading borderline checks to definitive PASS/FAIL
-and adding newly discovered fatal flaws. Deep verify runs as a sub-model call with 3 tool turns
-and a 45-second timeout.
+and adding newly discovered fatal flaws. Deep verify uses the primary model with full thinking
+and 3 tool turns, with a 90-second timeout.
 
 ### In-Iteration Revision Loop
 When the Verifier returns a PARTIAL verdict with actionable `suggestions` and no `fatal_flaws`,
@@ -139,7 +141,7 @@ the orchestrator calls `proposer.revise()` — a second, focused Proposer LLM ca
 only the specific issues flagged. The revised hypothesis is re-verified immediately. If it
 passes, the hypothesis is saved; if not, normal flow continues. Max 1 revision per iteration.
 
-Revise runs as a sub-model call with 3 tool turns and a 45-second timeout, using a dedicated
+Revise uses the primary model with full thinking and 3 tool turns, with a 90-second timeout, using a dedicated
 `REVISE_SYSTEM_PROMPT` to prevent role confusion (the model thinking it should generate new
 hypotheses instead of fixing existing ones).
 
@@ -269,18 +271,18 @@ Every agent system prompt now includes a hardened TOOL USAGE POLICY section:
 - `.env` loaded by Pydantic `BaseSettings` with `extra="ignore"`.
 - `deepseek_max_tokens` is **not 8K**. Their DeepSeek V4 Pro model accepts large context. Default is 65536.
 - `reasoning_effort="max"` with `extra_body={"thinking": {"type": "enabled"}}`.
-  Forced final answer and sub-model calls strip both.
+  Forced final answer and planner parse-failure retry strip both.
 - `OPENAI_API_KEY` only needed for embeddings. Memory system gracefully degrades without it.
 - `llm_max_tool_turns=12` is the global default, overridden by per-agent limits:
   `planner_max_tool_turns=2`, `planner_initial_tool_turns=0`, `proposer_max_tool_turns=6`,
   `verifier_max_tool_turns=6`, `self_critique_max_tool_turns=3`,
   `deep_verify_max_tool_turns=3`, `revise_max_tool_turns=3`.
 - Per-agent timeouts (seconds): `planner_timeout=60`, `proposer_timeout=120`,
-  `verifier_timeout=90`, `self_critique_timeout=30`, `deep_verify_timeout=45`,
-  `revise_timeout=45`.
+  `verifier_timeout=90`, `self_critique_timeout=60`, `deep_verify_timeout=90`,
+  `revise_timeout=90`.
 - `max_parallel_tools=2` — max tools executed per LLM turn.
 - `tool_fail_streak_limit=3` — consecutive failures before forced answer.
-- Sub-model defaults: `deepseek_sub_model="deepseek-v4-chat"` (cheap, no thinking),
+- Sub-model defaults (used only by planner parse-failure retry): `deepseek_sub_model="deepseek-v4-chat"` (cheap, no thinking),
   `openai_sub_model="gpt-4o-mini"`, with per-provider overrides.
 - Config fields `search_max_retries`, `fetch_max_retries`, and `memory_query_oversample_factor`
   use `Field(ge=, le=)` validators to prevent silent breakage from out-of-range values.

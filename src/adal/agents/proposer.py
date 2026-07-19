@@ -197,7 +197,7 @@ class Proposer(BaseAgent):
         old_system_prompt = self.system_prompt
         self.system_prompt = SELF_CRITIQUE_SYSTEM_PROMPT
         try:
-            response = await self._think_smart(context, thinking_enabled=False, model=self.sub_model, max_tool_turns=settings.self_critique_max_tool_turns, timeout_seconds=settings.self_critique_timeout, json_mode=True)
+            response = await self._think_smart(context, max_tool_turns=settings.self_critique_max_tool_turns, timeout_seconds=settings.self_critique_timeout, json_mode=True)
         finally:
             self.system_prompt = old_system_prompt
         return self.parse_json_block(response)
@@ -236,7 +236,7 @@ class Proposer(BaseAgent):
         old_system_prompt = self.system_prompt
         self.system_prompt = REVISE_SYSTEM_PROMPT
         try:
-            response = await self._think_smart(context, thinking_enabled=False, model=self.sub_model, max_tool_turns=settings.revise_max_tool_turns, timeout_seconds=settings.revise_timeout, json_mode=True)
+            response = await self._think_smart(context, max_tool_turns=settings.revise_max_tool_turns, timeout_seconds=settings.revise_timeout, json_mode=True)
         finally:
             self.system_prompt = old_system_prompt
         result = self.parse_json_block(response)
