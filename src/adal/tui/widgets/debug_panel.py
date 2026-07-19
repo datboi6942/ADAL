@@ -50,7 +50,7 @@ class DebugPanel(Vertical):
 
     def compose(self):
         yield Static("  DEBUG (LOW)  ", id="debug-header")
-        yield RichLog(id="debug-log", max_lines=3000, markup=True, highlight=True)
+        yield RichLog(id="debug-log", max_lines=3000, markup=True, highlight=True, auto_scroll=False)
 
     def on_mount(self):
         log = self.query_one("#debug-log", RichLog)
@@ -61,6 +61,7 @@ class DebugPanel(Vertical):
                 count += 1
         self._line_count = count
         self._update_header()
+        log.scroll_end(animate=False)
 
     def _update_header(self):
         try:
@@ -84,12 +85,10 @@ class DebugPanel(Vertical):
                 log.write(line)
                 count += 1
         self._line_count = count
+        log.scroll_end(animate=False)
 
     def write(self, category: str, event: str, detail: str, timestamp: str = "",
               verbosity: int = VERBOSITY_LOW):
-        if verbosity > _CURRENT_TIER:
-            return
-
         color = CATEGORY_COLORS.get(category, "white")
         if timestamp:
             prefix = f"[dim]{timestamp}[/dim]"
@@ -99,9 +98,6 @@ class DebugPanel(Vertical):
         tag = f"[bold {color}]{category.upper()}.{event.upper()}[/bold {color}]"
         detail_text = str(detail)[:1200].replace("\n", " ")
         line = f"{prefix} {tag} {detail_text}"
-        self._line_count += 1
-        if self._line_count % 10 == 0:
-            line += f"  [dim]({self._line_count})[/dim]"
 
         _DEBUG_LINES.append((line, verbosity))
         if len(_DEBUG_LINES) > _MAX_BUFFER:
@@ -109,4 +105,15 @@ class DebugPanel(Vertical):
             self._replay()
             return
 
-        self.query_one("#debug-log", RichLog).write(line)
+        if verbosity > _CURRENT_TIER:
+            return
+
+        self._line_count += 1
+        if self._line_count % 10 == 0:
+            line += f"  [dim]({self._line_count})[/dim]"
+
+        log = self.query_one("#debug-log", RichLog)
+        was_at_end = log.is_vertical_scroll_end
+        log.write(line)
+        if was_at_end:
+            log.scroll_end(animate=False)

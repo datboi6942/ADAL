@@ -7,7 +7,7 @@ from textual.screen import Screen
 from textual.widgets import Button, Footer, RichLog, Static
 
 from adal.config import settings
-from adal.tui.db_queries import get_hypotheses, get_interactions, get_session, get_validation_results
+from adal.tui.db_queries import get_debug_logs, get_hypotheses, get_interactions, get_session, get_validation_results
 from adal.tui.widgets.chat_history import ChatHistory, IterationCard
 from adal.tui.widgets.debug_panel import (
     VERBOSITY_HIGH,
@@ -150,6 +150,76 @@ class SessionDetailScreen(Screen, StatusAnimatableMixin):
             f"{session.domain.value}  \u2022  "
             f"Ask a follow-up question above\u2026"
         )
+
+        final_answer = ""
+        validated_count = 0
+        failed_count = 0
+        validated_results = []
+        failed_attempts = []
+        reasoning_log = []
+
+        for h in hypotheses:
+            hd = h.content or {}
+            hh = hd.get("hypothesis", {})
+            if h.status.value == "verified":
+                validated_count += 1
+                validated_results.append({"iteration": h.iteration, "hypothesis": hd, "verdict": {}})
+                fa = hh.get("final_answer") or hd.get("final_answer", "")
+                if fa:
+                    final_answer = str(fa)
+            elif h.status.value == "rejected":
+                failed_count += 1
+                reason = hh.get("reason", "Previously rejected")
+                failed_attempts.append({
+                    "iteration": h.iteration,
+                    "hypothesis_summary": str(hh.get("statement", str(hd)[:200])),
+                    "reason": str(reason),
+                })
+
+        if not final_answer and hypotheses:
+            last = hypotheses[-1]
+            hd = last.content or {}
+            hh = hd.get("hypothesis", {})
+            final_answer = str(hh.get("final_answer") or
+                            hd.get("final_answer", "") or
+                            hh.get("statement", "") or
+                            hh.get("analysis_summary", ""))
+
+        self._last_result = {
+            "session_id": self._session_id,
+            "query": self._original_query,
+            "domain": session.domain.value if session.domain else "unknown",
+            "status": session.status.value if session.status else "unknown",
+            "iterations": session.iteration or 0,
+            "hypotheses_tested": len(hypotheses),
+            "validated_count": validated_count,
+            "failed_count": failed_count,
+            "final_answer": final_answer,
+            "validated_results": validated_results,
+            "failed_attempts": failed_attempts,
+            "token_usage": {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "cost": {"total_cost": 0},
+            "elapsed_seconds": 0,
+            "reasoning_log": reasoning_log,
+        }
+
+        actions = VerticalScroll(classes="result-actions")
+        chat.mount(actions)
+        actions.mount(Button("\U0001f504 Continue Research", id="continue-research", variant="primary"))
+        actions.mount(Button("Export Markdown \u2193", id="export-result"))
+
+        debug_logs = await get_debug_logs(self._session_id)
+        if debug_logs:
+            panel = self.query_one(DebugPanel)
+            for entry in debug_logs:
+                ts = entry.created_at.strftime("%H:%M:%S") if entry.created_at else ""
+                panel.write(
+                    entry.category,
+                    entry.event,
+                    entry.detail,
+                    timestamp=ts,
+                    verbosity=entry.verbosity,
+                )
 
     def _build_card_detail(self, h, data: dict, hyp: dict, agent_role: str, valid_map: dict) -> str:
         parts = []
@@ -458,6 +528,8 @@ class SessionDetailScreen(Screen, StatusAnimatableMixin):
                 self.notify(f"Cognitive telemetry: {status}\nUsage: /telemetry [on/off]", title="Telemetry")
         elif cmd_name == "/diagnostics":
             self.app.push_telemetry_dashboard()
+        elif cmd_name == "/export":
+            self._export()
         else:
             self.notify(f"Unknown command: {cmd_name}. Type /help for available commands.", title="Command", severity="warning")
 
@@ -523,32 +595,27 @@ class SessionDetailScreen(Screen, StatusAnimatableMixin):
             self.notify("Nothing to copy", title="Copy", severity="warning")
 
     def _export(self):
-        asyncio.create_task(self._do_export())
+        self._do_export()
 
-    async def _do_export(self):
-        try:
-            result = self._last_result
-            if not result:
-                return
-            fa = result.get("final_answer", "")
-            text = f"# ADAL Research Result\n\n**Query:** {result.get('query', '')}\n"
-            text += f"**Status:** {result.get('status', 'unknown')}\n\n"
-            if isinstance(fa, str):
-                text += fa
-            elif isinstance(fa, dict):
-                for k, v in fa.items():
-                    text += f"## {k.replace('_', ' ').title()}\n{str(v)}\n\n"
+    def _do_export(self):
+        import re
 
-            from pathlib import Path
+        from adal.tui.widgets.export_dialog import ExportDialog
 
-            from adal.tui.utils import generate_export_filename
+        result = self._last_result
+        if not result:
+            return
+        fa = result.get("final_answer", "")
+        text = f"# ADAL Research Result\n\n**Query:** {result.get('query', '')}\n"
+        text += f"**Status:** {result.get('status', 'unknown')}\n\n"
+        if isinstance(fa, str):
+            text += fa
+        elif isinstance(fa, dict):
+            for k, v in fa.items():
+                text += f"## {k.replace('_', ' ').title()}\n{str(v)}\n\n"
 
-            content_preview = fa if isinstance(fa, str) else str(fa)
-            filename = await generate_export_filename(
-                result.get("query", ""), content_preview
-            )
-            path = Path(f"{filename}.md")
-            path.write_text(text)
-            self.notify(f"Exported to {path}", title="Export")
-        except Exception as e:
-            self.notify(str(e), title="Export Failed", severity="error")
+        name = re.sub(r"[^a-zA-Z0-9_\- ]", "", str(result.get("query", "adal_research"))).strip()
+        name = re.sub(r"\s+", "_", name)[:80].strip("_-")
+        filename = f"{name}.md" if name else "adal_research.md"
+
+        self.app.push_screen(ExportDialog(text, filename))

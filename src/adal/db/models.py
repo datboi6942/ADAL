@@ -81,6 +81,7 @@ class Session(Base):
     hypotheses: Mapped[list["Hypothesis"]] = relationship(back_populates="session", order_by="Hypothesis.iteration")
     interactions: Mapped[list["AgentInteraction"]] = relationship(back_populates="session")
     meta_diagnostics: Mapped[list["MetaDiagnostic"]] = relationship(back_populates="session")
+    debug_logs: Mapped[list["DebugLog"]] = relationship(back_populates="session", cascade="all, delete-orphan")
 
 
 class Hypothesis(Base):
@@ -179,3 +180,20 @@ class MetaDiagnostic(Base):
     )
 
     session: Mapped["Session"] = relationship(back_populates="meta_diagnostics")
+
+
+class DebugLog(Base):
+    __tablename__ = "debug_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    event: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    verbosity: Mapped[int] = mapped_column(Integer, default=0)
+    line_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=lambda: datetime.datetime.now(datetime.UTC)
+    )
+
+    session: Mapped["Session"] = relationship(back_populates="debug_logs")

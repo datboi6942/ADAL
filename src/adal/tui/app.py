@@ -18,6 +18,7 @@ from adal.tui.screens.settings.memory import MemorySettingsScreen
 from adal.tui.screens.settings.models import ModelSettingsScreen
 from adal.tui.screens.settings.pricing import PricingSettingsScreen
 from adal.tui.screens.settings.search import SearchSettingsScreen
+from adal.tui.screens.settings.telemetry import TelemetrySettingsScreen
 from adal.tui.screens.settings.theme import ThemeSettingsScreen
 from adal.tui.screens.telemetry_dashboard import TelemetryDashboardScreen
 from adal.tui.screens.welcome import WelcomeScreen
@@ -354,6 +355,7 @@ class ADALApp(App):
             "theme": ThemeSettingsScreen,
             "pricing": PricingSettingsScreen,
             "advanced": AdvancedSettingsScreen,
+            "telemetry": TelemetrySettingsScreen,
         }
         cls = screens.get(name)
         if cls:

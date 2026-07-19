@@ -1,4 +1,3 @@
-import asyncio
 
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
@@ -166,32 +165,27 @@ class ProcedureDetailScreen(Screen):
             self._export()
 
     def _export(self):
-        asyncio.create_task(self._do_export())
+        self._do_export()
 
-    async def _do_export(self):
-        try:
-            content = self._hypothesis.content or {}
-            hyp = content.get("hypothesis", {})
-            text = f"# {hyp.get('statement', 'Validated Procedure')}\n\n"
-            text += f"**Domain:** {self._session.domain.value.upper()}\n"
-            text += f"**Yield:** {hyp.get('expected_yield_range', 'N/A')}\n"
-            text += f"**Session:** {self._session.query}\n\n"
-            text += f"## Synthesis Procedure\n{hyp.get('synthesis_procedure', '')}\n\n"
-            if hyp.get("workup_procedure"):
-                text += f"## Workup\n{hyp.get('workup_procedure', '')}\n\n"
-            text += f"## Analysis\n{content.get('analysis_summary', '')}\n\n"
+    def _do_export(self):
+        import re
 
-            from pathlib import Path
+        from adal.tui.widgets.export_dialog import ExportDialog
 
-            from adal.tui.utils import generate_export_filename
+        content = self._hypothesis.content or {}
+        hyp = content.get("hypothesis", {})
+        text = f"# {hyp.get('statement', 'Validated Procedure')}\n\n"
+        text += f"**Domain:** {self._session.domain.value.upper()}\n"
+        text += f"**Yield:** {hyp.get('expected_yield_range', 'N/A')}\n"
+        text += f"**Session:** {self._session.query}\n\n"
+        text += f"## Synthesis Procedure\n{hyp.get('synthesis_procedure', '')}\n\n"
+        if hyp.get("workup_procedure"):
+            text += f"## Workup\n{hyp.get('workup_procedure', '')}\n\n"
+        text += f"## Analysis\n{content.get('analysis_summary', '')}\n\n"
 
-            content_preview = hyp.get("synthesis_procedure", "") or hyp.get("statement", "")
-            filename = await generate_export_filename(
-                self._session.query or hyp.get("statement", ""),
-                content_preview,
-            )
-            path = Path(f"{filename}.md")
-            path.write_text(text)
-            self.notify(f"Exported to {path}", title="Export")
-        except Exception as e:
-            self.notify(str(e), title="Export Failed", severity="error")
+        name = hyp.get("statement", "adal_procedure")
+        name = re.sub(r"[^a-zA-Z0-9_\- ]", "", str(name)).strip()
+        name = re.sub(r"\s+", "_", name)[:80].strip("_-")
+        filename = f"{name}.md" if name else "adal_procedure.md"
+
+        self.app.push_screen(ExportDialog(text, filename))
