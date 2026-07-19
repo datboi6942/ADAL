@@ -7,6 +7,7 @@ from textual.screen import Screen
 from textual.widgets import Button, Footer, RichLog, Static
 
 from adal.config import settings
+from adal.tui.screens.full_report import FullReportScreen
 from adal.tui.widgets.chat_history import ChatHistory, IterationCard
 from adal.tui.widgets.commands import COMMAND_REGISTRY
 from adal.tui.widgets.debug_panel import (
@@ -268,9 +269,7 @@ class DashboardScreen(Screen, StatusAnimatableMixin):
             qi.focus()
             self._continuation_context = self._last_result.get("session_id", "")
         elif bid == "view-full-result" and self._last_result:
-            sid = self._last_result.get("session_id", "")
-            if sid:
-                self.app.push_session_detail(sid)
+            self.app.push_screen(FullReportScreen(self._last_result))
         elif bid == "export-result" and self._last_result:
             self._export()
         elif bid == "settings-btn":
