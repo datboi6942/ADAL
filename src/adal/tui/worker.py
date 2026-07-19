@@ -175,7 +175,7 @@ class OrcWorker:
 
         try:
             result = await self.orc.run_restore(enriched, state=state)
-            await self._persist_debug_lines(result.get("session_id", session_id))
+            await self._persist_debug_lines(result.get("session_id", session_id), replace=False)
             self._safe_post_message(ResultReady(result))
         except asyncio.CancelledError:
             self._safe_post_message(ResultReady({"status": "cancelled", "domain": state.domain.value, "iterations": state.iteration}))
@@ -248,13 +248,18 @@ class OrcWorker:
             "verbosity": verbosity,
         })
 
-    async def _persist_debug_lines(self, session_id: str):
+    async def _persist_debug_lines(self, session_id: str, replace: bool = True):
         if not session_id or not self._session_debug_lines:
             return
         try:
-            from adal.tui.db_queries import delete_debug_logs, persist_debug_logs
-            await delete_debug_logs(session_id)
-            await persist_debug_logs(session_id, self._session_debug_lines)
+            from adal.tui.db_queries import delete_debug_logs, get_debug_logs, persist_debug_logs
+            if replace:
+                await delete_debug_logs(session_id)
+                await persist_debug_logs(session_id, self._session_debug_lines)
+            else:
+                existing = await get_debug_logs(session_id)
+                offset = max((e.line_order for e in existing), default=-1) + 1
+                await persist_debug_logs(session_id, self._session_debug_lines, start_offset=offset)
         except Exception:
             pass
 

@@ -143,7 +143,7 @@ async def get_debug_logs(session_id: str):
         return result.scalars().all()
 
 
-async def persist_debug_logs(session_id: str, entries: list[dict]):
+async def persist_debug_logs(session_id: str, entries: list[dict], start_offset: int = 0):
     if not entries:
         return
     sessionmaker = get_sessionmaker()
@@ -155,7 +155,7 @@ async def persist_debug_logs(session_id: str, entries: list[dict]):
                 event=entry["event"],
                 detail=entry["detail"],
                 verbosity=entry["verbosity"],
-                line_order=i,
+                line_order=start_offset + i,
             ))
         await db.commit()
 
