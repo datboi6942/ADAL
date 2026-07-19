@@ -346,9 +346,12 @@ class DashboardScreen(SelectableScreen, StatusAnimatableMixin):
 
         selected = self.get_selected_text()
         if selected and selected.strip():
-            pyperclip.copy(selected)
-            self.notify("Copied selection to clipboard", title="Copy")
-            return
+            try:
+                pyperclip.copy(selected)
+                self.notify("Copied selection to clipboard", title="Copy")
+                return
+            except pyperclip.PyperclipException:
+                pass
 
         from rich.text import Text as RichText
 

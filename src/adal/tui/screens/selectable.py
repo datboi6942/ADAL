@@ -12,4 +12,7 @@ class SelectableScreen(Screen):
 
         selected = self.get_selected_text()
         if selected and selected.strip():
-            pyperclip.copy(selected)
+            try:
+                pyperclip.copy(selected)
+            except pyperclip.PyperclipException:
+                pass

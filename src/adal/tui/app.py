@@ -332,14 +332,17 @@ class ADALApp(App):
         self.theme = next_theme
 
     def action_toggle_mouse(self):
-        driver = self._driver
-        driver._mouse = not driver._mouse
-        if driver._mouse:
-            driver._enable_mouse_support()
-            self.notify("Mouse: ON — text selection auto-copies to clipboard", title="Mouse")
-        else:
-            driver._disable_mouse_support()
-            self.notify("Mouse: OFF — native terminal selection available", title="Mouse")
+        try:
+            driver = self._driver
+            driver._mouse = not driver._mouse
+            if driver._mouse:
+                driver._enable_mouse_support()
+                self.notify("Mouse: ON — text selection auto-copies to clipboard", title="Mouse")
+            else:
+                driver._disable_mouse_support()
+                self.notify("Mouse: OFF — native terminal selection available", title="Mouse")
+        except (AttributeError, TypeError):
+            self.notify("Mouse toggle not available in this terminal", title="Mouse", severity="warning")
 
     def action_settings(self):
         self.push_screen(SettingsHubScreen())
