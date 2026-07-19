@@ -1,13 +1,13 @@
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Input, Label
 
 from adal.config import settings
+from adal.tui.screens.selectable import SelectableScreen
 from adal.tui.screens.settings.agents import _update_env
 
 
-class SearchSettingsScreen(Screen):
+class SearchSettingsScreen(SelectableScreen):
     def compose(self) -> ComposeResult:
         yield Header()
         with VerticalScroll(id="search-settings"):

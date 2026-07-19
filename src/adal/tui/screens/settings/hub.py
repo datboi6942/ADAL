@@ -1,10 +1,11 @@
 from textual.app import ComposeResult
 from textual.containers import Vertical
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Static
 
+from adal.tui.screens.selectable import SelectableScreen
 
-class SettingsHubScreen(Screen):
+
+class SettingsHubScreen(SelectableScreen):
     DEFAULT_CSS = """
     SettingsHubScreen {
         align: center middle;

@@ -3,11 +3,11 @@ import time
 
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, RichLog, Static
 
 from adal.config import settings
 from adal.tui.db_queries import get_debug_logs, get_hypotheses, get_interactions, get_session, get_validation_results
+from adal.tui.screens.selectable import SelectableScreen
 from adal.tui.widgets.chat_history import ChatHistory, IterationCard
 from adal.tui.widgets.debug_panel import (
     VERBOSITY_HIGH,
@@ -24,7 +24,7 @@ from adal.tui.worker import OrcWorker, ReasoningUpdate, ResultReady, StatusUpdat
 STATUS_ICONS = {"verified": "\u2713", "rejected": "\u2717", "proposed": "\u00b7", "validating": "\u23f3", "superseded": "~"}
 
 
-class SessionDetailScreen(Screen, StatusAnimatableMixin):
+class SessionDetailScreen(SelectableScreen, StatusAnimatableMixin):
     COMPONENT_CLASSES = {"input"}
 
     BINDINGS = [
@@ -553,11 +553,24 @@ class SessionDetailScreen(Screen, StatusAnimatableMixin):
         if not lines:
             self.notify("Debug log is empty", title="Copy Debug", severity="warning")
             return
-        pyperclip.copy("\n".join(lines))
-        self.notify(f"Copied {len(lines)} debug lines to clipboard", title="Copy Debug")
+        try:
+            pyperclip.copy("\n".join(lines))
+            self.notify(f"Copied {len(lines)} debug lines to clipboard", title="Copy Debug")
+        except pyperclip.PyperclipException:
+            self.notify("Clipboard not available — nothing copied", title="Copy Debug", severity="warning")
 
     def action_copy_all(self):
         import pyperclip
+
+        selected = self.get_selected_text()
+        if selected and selected.strip():
+            try:
+                pyperclip.copy(selected)
+                self.notify("Copied selection to clipboard", title="Copy")
+                return
+            except pyperclip.PyperclipException:
+                pass
+
         from rich.text import Text as RichText
         chat = self.query_one(ChatHistory)
         lines = []
@@ -589,8 +602,11 @@ class SessionDetailScreen(Screen, StatusAnimatableMixin):
                 pass
         text = "\n\n".join(lines)
         if text:
-            pyperclip.copy(text)
-            self.notify(f"Copied {len(lines)} blocks to clipboard", title="Copy")
+            try:
+                pyperclip.copy(text)
+                self.notify(f"Copied {len(lines)} blocks to clipboard", title="Copy")
+            except pyperclip.PyperclipException:
+                self.notify("Clipboard not available — nothing copied", title="Copy", severity="warning")
         else:
             self.notify("Nothing to copy", title="Copy", severity="warning")
 

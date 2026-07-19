@@ -1,10 +1,10 @@
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Vertical
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Static
 
 from adal import __version__
+from adal.tui.screens.selectable import SelectableScreen
 
 LOGO = """\
 [bold $accent]   █████╗ ██████╗  █████╗ ██╗
@@ -15,7 +15,7 @@ LOGO = """\
    ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚══════╝[/bold $accent]"""
 
 
-class WelcomeScreen(Screen):
+class WelcomeScreen(SelectableScreen):
     BINDINGS = [
         Binding("up", "focus_previous", "Previous", show=False),
         Binding("down", "focus_next", "Next", show=False),

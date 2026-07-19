@@ -2,10 +2,10 @@ from pathlib import Path
 
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Input, Label, TabbedContent, TabPane
 
 from adal.config import settings
+from adal.tui.screens.selectable import SelectableScreen
 
 ENV_PATH = Path(".env")
 
@@ -30,7 +30,7 @@ def _update_env(key: str, value: str):
     ENV_PATH.write_text("\n".join(lines) + "\n")
 
 
-class AgentSettingsScreen(Screen):
+class AgentSettingsScreen(SelectableScreen):
     def compose(self) -> ComposeResult:
         yield Header()
         with TabbedContent(id="agent-tabs"):

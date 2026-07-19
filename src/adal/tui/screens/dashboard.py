@@ -3,11 +3,11 @@ import time
 
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, RichLog, Static
 
 from adal.config import settings
 from adal.tui.screens.full_report import FullReportScreen
+from adal.tui.screens.selectable import SelectableScreen
 from adal.tui.widgets.chat_history import ChatHistory, IterationCard
 from adal.tui.widgets.commands import COMMAND_REGISTRY
 from adal.tui.widgets.debug_panel import (
@@ -23,7 +23,7 @@ from adal.tui.widgets.suggestion_list import SuggestionList
 from adal.tui.worker import OrcWorker, ReasoningUpdate, ResultReady, StatusUpdate, ToolCallUpdate
 
 
-class DashboardScreen(Screen, StatusAnimatableMixin):
+class DashboardScreen(SelectableScreen, StatusAnimatableMixin):
     COMPONENT_CLASSES = {"input"}
 
     BINDINGS = [
@@ -338,11 +338,24 @@ class DashboardScreen(Screen, StatusAnimatableMixin):
         if not lines:
             self.notify("Debug log is empty", title="Copy Debug", severity="warning")
             return
-        pyperclip.copy("\n".join(lines))
-        self.notify(f"Copied {len(lines)} debug lines to clipboard", title="Copy Debug")
+        try:
+            pyperclip.copy("\n".join(lines))
+            self.notify(f"Copied {len(lines)} debug lines to clipboard", title="Copy Debug")
+        except pyperclip.PyperclipException:
+            self.notify("Clipboard not available — nothing copied", title="Copy Debug", severity="warning")
 
     def action_copy_all(self):
         import pyperclip
+
+        selected = self.get_selected_text()
+        if selected and selected.strip():
+            try:
+                pyperclip.copy(selected)
+                self.notify("Copied selection to clipboard", title="Copy")
+                return
+            except pyperclip.PyperclipException:
+                pass
+
         from rich.text import Text as RichText
 
         chat = self.query_one(ChatHistory)
@@ -375,8 +388,11 @@ class DashboardScreen(Screen, StatusAnimatableMixin):
                 pass
         text = "\n\n".join(lines)
         if text:
-            pyperclip.copy(text)
-            self.notify(f"Copied {len(lines)} blocks to clipboard", title="Copy")
+            try:
+                pyperclip.copy(text)
+                self.notify(f"Copied {len(lines)} blocks to clipboard", title="Copy")
+            except pyperclip.PyperclipException:
+                self.notify("Clipboard not available — nothing copied", title="Copy", severity="warning")
         else:
             self.notify("Nothing to copy", title="Copy", severity="warning")
 

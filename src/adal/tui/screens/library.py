@@ -1,14 +1,14 @@
 import asyncio
 
 from textual.containers import Horizontal, VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Label, Select
 
 from adal.tui.db_queries import get_validated_procedures
 from adal.tui.screens.procedure_detail import ProcedureDetailScreen
+from adal.tui.screens.selectable import SelectableScreen
 
 
-class LibraryScreen(Screen):
+class LibraryScreen(SelectableScreen):
     DEFAULT_CSS = """
     LibraryScreen { align: center top; }
     #library-content { height: 1fr; padding: 1 2; }
