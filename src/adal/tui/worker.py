@@ -252,7 +252,8 @@ class OrcWorker:
         if not session_id or not self._session_debug_lines:
             return
         try:
-            from adal.tui.db_queries import persist_debug_logs
+            from adal.tui.db_queries import delete_debug_logs, persist_debug_logs
+            await delete_debug_logs(session_id)
             await persist_debug_logs(session_id, self._session_debug_lines)
         except Exception:
             pass

@@ -148,12 +148,16 @@ class ExportDialog(Screen):
         if not filename:
             self.notify("Enter a filename", severity="warning", title="Export")
             return
+        filename = Path(filename).name
+        if not filename:
+            self.notify("Enter a valid filename", severity="warning", title="Export")
+            return
         if not filename.endswith(".md"):
             filename += ".md"
         path = Path(self._directory) / filename
         try:
             path.write_text(self._content, encoding="utf-8")
             self.notify(f"Exported to {path}", title="Export")
+            self.dismiss()
         except Exception as e:
             self.notify(str(e), severity="error", title="Export Failed")
-        self.dismiss()

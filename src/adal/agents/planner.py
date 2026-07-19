@@ -60,7 +60,6 @@ DOMAIN_KEYWORDS = {
         r"\bhot[\s-]?plate\b", r"\bstir[\s-]?(?:bar|ring)\b", r"\bbunsen\b",
         r"\btlc\b", r"\bthin[\s-]?layer\b", r"\bmelting[\s-]?point\b",
         r"\bmass[\s-]?spec\b", r"\bir[\s-]?spec(?:troscopy)?\b",
-        r"\b(?:make|making)\s+\w" , r"\bprepar(?:e|ing)\s+\w",
     ],
     Domain.PHYSICS: [
         r"\bforce\b", r"\benergy\b", r"\bmomentum\b", r"\bthermodynamics\b",

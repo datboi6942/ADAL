@@ -213,7 +213,7 @@ class SessionDetailScreen(Screen, StatusAnimatableMixin):
             panel = self.query_one(DebugPanel)
             for entry in debug_logs:
                 ts = entry.created_at.strftime("%H:%M:%S") if entry.created_at else ""
-                panel.write(
+                panel.write_historical(
                     entry.category,
                     entry.event,
                     entry.detail,
