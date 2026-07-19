@@ -2,8 +2,9 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Input, Label, Select, Static, Switch
+
+from adal.tui.screens.selectable import SelectableScreen
 
 ENV_PATH = Path(".env")
 
@@ -24,7 +25,7 @@ PROVIDER_DEFAULTS = {
 }
 
 
-class ProviderScreen(Screen):
+class ProviderScreen(SelectableScreen):
     def compose(self) -> ComposeResult:
         yield Header()
         with Container(id="main"):
@@ -68,7 +69,7 @@ class ProviderScreen(Screen):
             self.app.exit()
 
 
-class CredentialsScreen(Screen):
+class CredentialsScreen(SelectableScreen):
     def compose(self) -> ComposeResult:
         yield Header()
         with VerticalScroll(id="main"):
@@ -109,7 +110,7 @@ class CredentialsScreen(Screen):
             self.app.pop_screen()
 
 
-class ReviewScreen(Screen):
+class ReviewScreen(SelectableScreen):
     def compose(self) -> ComposeResult:
         yield Header()
         with VerticalScroll(id="main"):

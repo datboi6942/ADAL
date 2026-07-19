@@ -32,10 +32,18 @@ HELP_TEXT = """\
 | `F1` | This help screen |
 | `F2` | Command palette (search all actions) |
 | `F5` | Stop current research run |
+| `F6` | Toggle debug panel |
+| `F7` | Copy debug log to clipboard |
 | `F9` | Go back to previous screen |
+| `Ctrl+C` | Copy selected text (if any) or all chat |
 | `Ctrl+D` | Cycle through 9 themes |
+| `Ctrl+M` | Toggle mouse (on=click-drag auto-copy, off=native terminal selection) |
 | `Ctrl+,` | Open agent settings |
 | `Q` | Quit ADAL |
+
+## Text Selection
+Click and drag to highlight text — automatically copies to clipboard on release.
+Press `Ctrl+M` to disable mouse capture for native terminal text selection.
 
 ## Navigation
 Press **F2** to open the command palette, then type to search:
@@ -88,6 +96,7 @@ class HelpScreen(ModalScreen[None]):
 
 
 class ADALApp(App):
+    ALLOW_SELECT = True
     COMMANDS = {ADALProvider}
     CSS = """
     .agent-planner { color: $accent; }
@@ -294,6 +303,7 @@ class ADALApp(App):
         Binding("f5", "stop", "Stop"),
         Binding("f9", "back", "Back"),
         Binding("ctrl+d", "toggle_theme", "Theme", priority=True),
+        Binding("ctrl+m", "toggle_mouse", "Mouse", priority=True),
         Binding("ctrl+comma", "settings", "Settings"),
         Binding("q", "quit", "Quit"),
     ]
@@ -320,6 +330,16 @@ class ADALApp(App):
             idx = -1
         next_theme = THEMES[(idx + 1) % len(THEMES)]
         self.theme = next_theme
+
+    def action_toggle_mouse(self):
+        driver = self._driver
+        driver._mouse = not driver._mouse
+        if driver._mouse:
+            driver._enable_mouse_support()
+            self.notify("Mouse: ON — text selection auto-copies to clipboard", title="Mouse")
+        else:
+            driver._disable_mouse_support()
+            self.notify("Mouse: OFF — native terminal selection available", title="Mouse")
 
     def action_settings(self):
         self.push_screen(SettingsHubScreen())

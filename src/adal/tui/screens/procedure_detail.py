@@ -1,10 +1,10 @@
 
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Label, Static
 
 from adal.db.models import Hypothesis, Session, ValidationResult
+from adal.tui.screens.selectable import SelectableScreen
 
 CONFIDENCE_BAR = ["\u2581", "\u2582", "\u2583", "\u2584", "\u2585", "\u2586", "\u2587", "\u2588"]
 
@@ -13,7 +13,7 @@ def _s(text: object) -> str:
     return str(text or "").replace("[", "\\[")
 
 
-class ProcedureDetailScreen(Screen):
+class ProcedureDetailScreen(SelectableScreen):
     DEFAULT_CSS = """
     ProcedureDetailScreen {
         align: center top;

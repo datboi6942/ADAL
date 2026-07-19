@@ -1,8 +1,8 @@
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Label, Select
 
+from adal.tui.screens.selectable import SelectableScreen
 from adal.tui.screens.settings.agents import _update_env
 
 THEME_OPTIONS = [
@@ -17,7 +17,7 @@ THEME_OPTIONS = [
 ]
 
 
-class ThemeSettingsScreen(Screen):
+class ThemeSettingsScreen(SelectableScreen):
     DEFAULT_CSS = """
     #theme-settings {
         height: auto;

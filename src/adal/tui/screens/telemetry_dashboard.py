@@ -1,11 +1,11 @@
 import asyncio
 
 from textual.containers import VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Footer, Header, Select, Static
 
 from adal.db.models import DiagnosticSeverity
 from adal.tui.db_queries import get_diagnostic_stats, get_meta_diagnostics
+from adal.tui.screens.selectable import SelectableScreen
 
 SEVERITY_ICONS = {
     DiagnosticSeverity.CRITICAL: "\U0001f534",
@@ -22,7 +22,7 @@ SEVERITY_COLORS = {
 }
 
 
-class TelemetryDashboardScreen(Screen):
+class TelemetryDashboardScreen(SelectableScreen):
     DEFAULT_CSS = """
     TelemetryDashboardScreen {
         align: center top;

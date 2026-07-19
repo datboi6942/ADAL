@@ -1,13 +1,13 @@
 import asyncio
 
 from textual.containers import VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Label, Static
 
 from adal.tui.db_queries import list_sessions
+from adal.tui.screens.selectable import SelectableScreen
 
 
-class HistoryScreen(Screen):
+class HistoryScreen(SelectableScreen):
     DEFAULT_CSS = """
     #history-content {
         height: auto;

@@ -3,8 +3,9 @@ from pathlib import Path
 
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Markdown, Static
+
+from adal.tui.screens.selectable import SelectableScreen
 
 CONFIDENCE_BAR = ["\u2581", "\u2582", "\u2583", "\u2584", "\u2585", "\u2586", "\u2587", "\u2588"]
 
@@ -13,7 +14,7 @@ def _s(text: object) -> str:
     return str(text or "").replace("[", "\\[")
 
 
-class FullReportScreen(Screen):
+class FullReportScreen(SelectableScreen):
     DEFAULT_CSS = """
     FullReportScreen {
         align: center top;

@@ -2,11 +2,12 @@ from pathlib import Path
 
 from textual.binding import Binding
 from textual.containers import Horizontal
-from textual.screen import Screen
 from textual.widgets import Button, DirectoryTree, Input, Static
 
+from adal.tui.screens.selectable import SelectableScreen
 
-class ExportDialog(Screen):
+
+class ExportDialog(SelectableScreen):
     BINDINGS = [
         Binding("escape", "dismiss", "Cancel"),
         Binding("ctrl+s", "save", "Save"),

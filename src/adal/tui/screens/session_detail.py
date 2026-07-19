@@ -3,11 +3,11 @@ import time
 
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Button, Footer, RichLog, Static
 
 from adal.config import settings
 from adal.tui.db_queries import get_debug_logs, get_hypotheses, get_interactions, get_session, get_validation_results
+from adal.tui.screens.selectable import SelectableScreen
 from adal.tui.widgets.chat_history import ChatHistory, IterationCard
 from adal.tui.widgets.debug_panel import (
     VERBOSITY_HIGH,
@@ -24,7 +24,7 @@ from adal.tui.worker import OrcWorker, ReasoningUpdate, ResultReady, StatusUpdat
 STATUS_ICONS = {"verified": "\u2713", "rejected": "\u2717", "proposed": "\u00b7", "validating": "\u23f3", "superseded": "~"}
 
 
-class SessionDetailScreen(Screen, StatusAnimatableMixin):
+class SessionDetailScreen(SelectableScreen, StatusAnimatableMixin):
     COMPONENT_CLASSES = {"input"}
 
     BINDINGS = [
@@ -558,6 +558,13 @@ class SessionDetailScreen(Screen, StatusAnimatableMixin):
 
     def action_copy_all(self):
         import pyperclip
+
+        selected = self.get_selected_text()
+        if selected and selected.strip():
+            pyperclip.copy(selected)
+            self.notify("Copied selection to clipboard", title="Copy")
+            return
+
         from rich.text import Text as RichText
         chat = self.query_one(ChatHistory)
         lines = []
