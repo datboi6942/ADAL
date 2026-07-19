@@ -62,6 +62,7 @@ class OrcWorker:
         self._running = False
         self._current_agent: str = ""
         self._debug = False
+        self._session_debug_lines: list[dict] = []
 
     @property
     def running(self) -> bool:
@@ -80,11 +81,13 @@ class OrcWorker:
         self.orc.set_debug_callback(self._on_debug)
         self._running = True
         self._task = asyncio.current_task()
+        self._session_debug_lines = []
 
         self._wrap_tool_executors(self.orc)
 
         try:
             result = await self.orc.run(query)
+            await self._persist_debug_lines(result.get("session_id", ""))
             self._safe_post_message(ResultReady(result))
         except asyncio.CancelledError:
             result = {"status": "cancelled", "domain": "unknown", "iterations": 0}
@@ -107,6 +110,7 @@ class OrcWorker:
         self.orc.set_debug_callback(self._on_debug)
         self._running = True
         self._task = asyncio.current_task()
+        self._session_debug_lines = []
 
         from sqlalchemy import select
 
@@ -171,6 +175,7 @@ class OrcWorker:
 
         try:
             result = await self.orc.run_restore(enriched, state=state)
+            await self._persist_debug_lines(result.get("session_id", session_id), replace=False)
             self._safe_post_message(ResultReady(result))
         except asyncio.CancelledError:
             self._safe_post_message(ResultReady({"status": "cancelled", "domain": state.domain.value, "iterations": state.iteration}))
@@ -203,6 +208,7 @@ class OrcWorker:
                             (list(kwargs.items()) + [("query", str(args[0])[:80])] if args else [])
                         )
                         if self._debug:
+                            self._track_debug("tool", _tn, f"Calling: {args_str[:200]}")
                             self._safe_post_message(
                                 DebugLine("tool", _tn, f"Calling: {args_str[:200]}")
                             )
@@ -213,6 +219,7 @@ class OrcWorker:
                                 ToolCallUpdate(_al, _tn, args_str[:100], result_preview)
                             )
                             if self._debug:
+                                self._track_debug("tool", _tn, f"{args_str[:200]} → {result_preview}")
                                 self._safe_post_message(
                                     DebugLine("tool", _tn, f"{args_str[:200]} → {result_preview}")
                                 )
@@ -228,18 +235,45 @@ class OrcWorker:
 
     async def _on_debug(self, category: str, event: str, detail: str = "",
                         verbosity: int = VERBOSITY_LOW):
+        self._track_debug(category, event, detail, verbosity)
         if self._debug:
             self._safe_post_message(DebugLine(category, event, detail, verbosity=verbosity))
+
+    def _track_debug(self, category: str, event: str, detail: str = "",
+                     verbosity: int = VERBOSITY_LOW):
+        self._session_debug_lines.append({
+            "category": category,
+            "event": event,
+            "detail": str(detail)[:1200],
+            "verbosity": verbosity,
+        })
+
+    async def _persist_debug_lines(self, session_id: str, replace: bool = True):
+        if not session_id or not self._session_debug_lines:
+            return
+        try:
+            from adal.tui.db_queries import delete_debug_logs, get_debug_logs, persist_debug_logs
+            if replace:
+                await delete_debug_logs(session_id)
+                await persist_debug_logs(session_id, self._session_debug_lines)
+            else:
+                existing = await get_debug_logs(session_id)
+                offset = max((e.line_order for e in existing), default=-1) + 1
+                await persist_debug_logs(session_id, self._session_debug_lines, start_offset=offset)
+        except Exception:
+            pass
 
     async def _on_status(self, name: str, status: str, detail: str = "",
                          verbosity: int = VERBOSITY_LOW):
         self._current_agent = name.lower()
         self._safe_post_message(StatusUpdate(name, status, detail))
         if self._debug and detail:
+            self._track_debug(name.lower(), status, detail[:800], verbosity)
             self._safe_post_message(DebugLine(name.lower(), status, detail[:800], verbosity=verbosity))
 
     async def _on_reasoning(self, name: str, reasoning: str,
                             verbosity: int = VERBOSITY_LOW):
         self._safe_post_message(ReasoningUpdate(name, reasoning))
         if self._debug:
+            self._track_debug(name.lower(), "reasoning", reasoning[:1000], verbosity)
             self._safe_post_message(DebugLine(name.lower(), "reasoning", reasoning[:1000], verbosity=verbosity))

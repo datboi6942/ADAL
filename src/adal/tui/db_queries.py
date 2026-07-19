@@ -2,6 +2,7 @@ from sqlalchemy import desc, func, select
 
 from adal.db.models import (
     AgentInteraction,
+    DebugLog,
     DiagnosticSeverity,
     Domain,
     Hypothesis,
@@ -129,3 +130,39 @@ async def get_diagnostic_stats():
             .group_by(MetaDiagnostic.severity)
         )
         return dict(result.all())
+
+
+async def get_debug_logs(session_id: str):
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as db:
+        result = await db.execute(
+            select(DebugLog)
+            .where(DebugLog.session_id == session_id)
+            .order_by(DebugLog.line_order)
+        )
+        return result.scalars().all()
+
+
+async def persist_debug_logs(session_id: str, entries: list[dict], start_offset: int = 0):
+    if not entries:
+        return
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as db:
+        for i, entry in enumerate(entries):
+            db.add(DebugLog(
+                session_id=session_id,
+                category=entry["category"],
+                event=entry["event"],
+                detail=entry["detail"],
+                verbosity=entry["verbosity"],
+                line_order=start_offset + i,
+            ))
+        await db.commit()
+
+
+async def delete_debug_logs(session_id: str):
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as db:
+        from sqlalchemy import delete
+        await db.execute(delete(DebugLog).where(DebugLog.session_id == session_id))
+        await db.commit()
