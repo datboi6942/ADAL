@@ -14,5 +14,6 @@ class SelectableScreen(Screen):
         if selected and selected.strip():
             try:
                 pyperclip.copy(selected)
+                self.clear_selection()
             except pyperclip.PyperclipException:
                 pass
