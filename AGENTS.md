@@ -104,7 +104,7 @@ To prevent LLM death-spirals (3-6 minute tool loops chasing dead URLs):
   `planner_initial_tool_turns=0` (no tools). All configurable via `.env` / Settings UI.
 - **Per-agent timeouts** (seconds): `planner_timeout=60`, `proposer_timeout=120`,
   `verifier_timeout=90`, `self_critique_timeout=60`, `deep_verify_timeout=90`,
-  `revise_timeout=45`. Wall-clock bailout triggers forced final answer.
+  `revise_timeout=90`. Wall-clock bailout triggers forced final answer.
 - **Failed-tool short-circuit**: `_tool_failed()` in `client.py` detects errors (HTTP 403,
   timeout, PDF unreadable, search failed). After `tool_fail_streak_limit=3` consecutive
   failures, the tool loop breaks → forced final answer.
@@ -141,7 +141,7 @@ the orchestrator calls `proposer.revise()` — a second, focused Proposer LLM ca
 only the specific issues flagged. The revised hypothesis is re-verified immediately. If it
 passes, the hypothesis is saved; if not, normal flow continues. Max 1 revision per iteration.
 
-Revise uses the primary model with full thinking and 3 tool turns, with a 45-second timeout, using a dedicated
+Revise uses the primary model with full thinking and 3 tool turns, with a 90-second timeout, using a dedicated
 `REVISE_SYSTEM_PROMPT` to prevent role confusion (the model thinking it should generate new
 hypotheses instead of fixing existing ones).
 
@@ -279,7 +279,7 @@ Every agent system prompt now includes a hardened TOOL USAGE POLICY section:
   `deep_verify_max_tool_turns=3`, `revise_max_tool_turns=3`.
 - Per-agent timeouts (seconds): `planner_timeout=60`, `proposer_timeout=120`,
   `verifier_timeout=90`, `self_critique_timeout=60`, `deep_verify_timeout=90`,
-  `revise_timeout=45`.
+  `revise_timeout=90`.
 - `max_parallel_tools=2` — max tools executed per LLM turn.
 - `tool_fail_streak_limit=3` — consecutive failures before forced answer.
 - Sub-model defaults (used only by planner parse-failure retry): `deepseek_sub_model="deepseek-v4-chat"` (cheap, no thinking),

@@ -118,7 +118,7 @@ class Settings(BaseSettings):
     verifier_timeout: float = 90.0
     self_critique_timeout: float = 60.0
     deep_verify_timeout: float = 90.0
-    revise_timeout: float = 45.0
+    revise_timeout: float = 90.0
 
     max_parallel_tools: int = 2
     tool_fail_streak_limit: int = 3
