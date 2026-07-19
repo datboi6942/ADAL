@@ -553,8 +553,11 @@ class SessionDetailScreen(SelectableScreen, StatusAnimatableMixin):
         if not lines:
             self.notify("Debug log is empty", title="Copy Debug", severity="warning")
             return
-        pyperclip.copy("\n".join(lines))
-        self.notify(f"Copied {len(lines)} debug lines to clipboard", title="Copy Debug")
+        try:
+            pyperclip.copy("\n".join(lines))
+            self.notify(f"Copied {len(lines)} debug lines to clipboard", title="Copy Debug")
+        except pyperclip.PyperclipException:
+            self.notify("Clipboard not available — nothing copied", title="Copy Debug", severity="warning")
 
     def action_copy_all(self):
         import pyperclip
@@ -599,8 +602,11 @@ class SessionDetailScreen(SelectableScreen, StatusAnimatableMixin):
                 pass
         text = "\n\n".join(lines)
         if text:
-            pyperclip.copy(text)
-            self.notify(f"Copied {len(lines)} blocks to clipboard", title="Copy")
+            try:
+                pyperclip.copy(text)
+                self.notify(f"Copied {len(lines)} blocks to clipboard", title="Copy")
+            except pyperclip.PyperclipException:
+                self.notify("Clipboard not available — nothing copied", title="Copy", severity="warning")
         else:
             self.notify("Nothing to copy", title="Copy", severity="warning")
 
