@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -94,7 +95,7 @@ async def run_script(code: str) -> dict:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "python3",
+            os.environ.get("ADAL_PYTHON_BIN", sys.executable),
             str(script_path),
             cwd=str(sandbox_dir),
             stdout=asyncio.subprocess.PIPE,

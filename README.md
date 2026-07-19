@@ -94,15 +94,129 @@ ADAL is a **model-agnostic multi-agent framework** for autonomous scientific dis
 ### Prerequisites
 - **Python 3.11+** (tested on 3.13)
 - **[uv](https://docs.astral.sh/uv/)** — fast Python package manager
+- **[Git](https://git-scm.com/)** — version control (needed to clone the repo)
 - **Docker** (optional — for containerized deployment)
 
-### Setup
+#### Supported Platforms
+
+| Platform | Versions | Notes |
+|----------|----------|-------|
+| **Linux** | Ubuntu 22.04+, Debian 12+, Fedora 39+, Arch | All functionality tested |
+| **macOS** | 13 (Ventura)+, Apple Silicon & Intel | All packages ship native `arm64` wheels |
+| **Windows** | 10 build 19041+ / 11 (native or WSL2) | **WSL2 recommended** for full compatibility |
+
+### Linux
+
+#### Ubuntu / Debian
+
+```bash
+# Install system dependencies
+sudo apt update && sudo apt install -y python3.13 python3.13-venv git
+
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Or via pipx: pipx install uv
+
+# Reload shell or restart terminal, then:
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+> **RDKit note:** If `uv sync` fails with RDKit compilation errors, install system headers: `sudo apt install -y libboost-all-dev libeigen3-dev`
+
+#### Fedora / RHEL
+
+```bash
+sudo dnf install -y python3.13 git
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+> **RDKit note:** If compilation fails: `sudo dnf install -y boost-devel eigen3-devel`
+
+#### Arch Linux
+
+```bash
+sudo pacman -S python git uv
+```
+
+> **RDKit note:** If compilation fails: `sudo pacman -S boost eigen`
+
+### macOS
+
+macOS 13 (Ventura) or newer is required. Both Apple Silicon (M1–M4) and Intel Macs are supported — all scientific packages ship native `arm64` wheels.
+
+```bash
+# Step 1: Install Homebrew (skip if already installed)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Step 2: Install Xcode Command Line Tools (skip if already installed)
+xcode-select --install
+
+# Step 3: Install Python, uv, and Git
+brew install python@3.13 uv git
+```
+
+> **RDKit note:** RDKit wheels are available for macOS arm64/x86_64 and should install cleanly with `uv sync`. If you encounter compilation errors, install it via Homebrew: `brew install rdkit`
+
+### Windows
+
+Two options are available. **WSL2 is strongly recommended** — it provides the full Linux toolchain and avoids Windows-specific edge cases.
+
+#### Option A: WSL2 (Recommended)
+
+1. Open PowerShell as **Administrator** and install WSL2:
+   ```powershell
+   wsl --install
+   ```
+2. Restart your computer when prompted.
+3. Open the installed Ubuntu distribution from the Start Menu.
+4. Follow the **Ubuntu / Debian** instructions above.
+
+All ADAL functionality works via WSL2. The TUI renders correctly in Windows Terminal (the default WSL terminal).
+
+#### Option B: Native Windows
+
+Windows 10 build 19041+ or Windows 11 is required. **Use Windows Terminal** (free from the Microsoft Store) — the classic `cmd.exe` and PowerShell terminals lack truecolor support needed by the Textual TUI.
+
+```powershell
+# Step 1: Install Python (run in PowerShell)
+winget install Python.Python.3.13
+# IMPORTANT: Check "Add Python to PATH" during installation.
+# Or download from https://python.org
+
+# Step 2: Install Git
+winget install Git.Git
+
+# Step 3: Install uv (run in PowerShell)
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Step 4: Restart your terminal, then verify
+uv --version
+```
+
+> **RDKit on Windows:** RDKit does not ship a reliable PyPI wheel for native Windows. Install it via conda:
+> ```powershell
+> conda create -n adal python=3.13 rdkit -c conda-forge
+> conda activate adal
+> ```
+
+> **Sandbox Python binary:** ADAL's sandbox uses `python3` by default. On native Windows, the command is `python`. Set in `.env`:
+> ```ini
+> ADAL_PYTHON_BIN=python
+> ```
+
+> **Long paths:** If you encounter `FileNotFoundError`, enable long path support (Administrator PowerShell):
+> ```powershell
+> New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+> ```
+
+### Common Setup (All Platforms)
+
+Once your platform prerequisites are installed, the remaining steps are the same across all operating systems:
 
 ```bash
 git clone https://github.com/anomalyco/ADAL.git
 cd ADAL
 
-# Install dependencies with uv
 cp .env.example .env
 # Edit .env with your API keys (at minimum DEEPSEEK_API_KEY)
 uv sync
@@ -266,6 +380,15 @@ Memory gracefully degrades if `OPENAI_API_KEY` is not set — agents operate wit
 ```bash
 uv run adal          # Opens welcome screen
 ```
+
+#### macOS Function Keys
+
+By default, macOS uses F1–F12 as media and brightness keys. To use ADAL's F-key bindings (F1 help, F2 command palette, F5 stop, F6/F7/F8 debug panel, F9 back):
+
+- **Option A:** Hold the `Fn` key (bottom-left of keyboard) while pressing the F-key.
+- **Option B (recommended):** Go to **System Preferences → Keyboard** and check **"Use F1, F2, etc. keys as standard function keys."**
+
+The `Ctrl+,` shortcut to open Settings Hub maps to `⌘,` on macOS. For the best TUI rendering, use **[iTerm2](https://iterm2.com)** — the built-in Terminal.app has limited color and Unicode support.
 
 ### Keybindings
 
@@ -1002,6 +1125,58 @@ SQLite only supports one writer at a time. If running multiple ADAL instances, u
 
 ```bash
 DATABASE_URL=sqlite+aiosqlite:///adal_instance2.db uv run adal
+```
+
+#### macOS: Function keys don't work
+
+Enable standard function keys in **System Preferences → Keyboard**, or hold `Fn` while pressing F-keys. See [macOS Function Keys](#macos-function-keys) above for details.
+
+#### macOS: Terminal rendering issues / garbled output
+
+The built-in Terminal.app has limited color and Unicode support. Use **[iTerm2](https://iterm2.com)** (free) for the best TUI experience. Ensure **Preferences → Profiles → Text → "Use Unicode version 9 widths"** is checked.
+
+#### macOS: Python not found after Homebrew install
+
+Add Homebrew's Python to your PATH:
+
+```bash
+# Apple Silicon:
+echo 'export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"' >> ~/.zshrc
+# Intel Macs:
+echo 'export PATH="/usr/local/opt/python@3.13/libexec/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+#### Windows: "python3 is not recognized"
+
+ADAL's sandbox uses `python3` by default. On native Windows, set in `.env`:
+
+```ini
+ADAL_PYTHON_BIN=python
+```
+
+#### Windows: Terminal shows garbled characters
+
+Use **Windows Terminal** (free from the Microsoft Store) — `cmd.exe` and classic PowerShell lack truecolor support needed by the Textual TUI.
+
+#### Windows: RDKit fails to install with pip/uv
+
+RDKit on native Windows requires conda. See [Windows native instructions](#option-b-native-windows) above, or use WSL2.
+
+#### Linux: RDKit fails to compile
+
+Install system headers before `uv sync`:
+- **Ubuntu/Debian:** `sudo apt install -y libboost-all-dev libeigen3-dev`
+- **Fedora:** `sudo dnf install -y boost-devel eigen3-devel`
+- **Arch:** `sudo pacman -S boost eigen`
+
+#### Linux: "uv: command not found" after curl install
+
+Ensure `~/.local/bin` is in your PATH:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
 ---
