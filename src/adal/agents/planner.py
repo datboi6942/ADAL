@@ -43,7 +43,7 @@ DOMAIN_KEYWORDS = {
         r"\bprotecting[\s-]?group\b", r"\bester\b", r"\bketone\b",
         r"\baldehyde\b", r"\balcohol\b", r"\bcarbonyl\b",
         r"\bcarboxylic[\s-]?acid\b", r"\bphenidine\b",
-        r"\bprecursor\b", r"\bprepar(?:ation|e|ing)\b",
+        r"\bprecursor\b", r"\bpreparation\b",
         r"\bdistill(?:ation)?\b", r"\bextract(?:ion)?\b", r"\bfiltrat(?:ion|e)\b",
         r"\bprecipitat(?:ion|e)\b", r"\bmolar(?:ity)?\b", r"\bmoles?\b",
         r"\bconcentrat(?:ion|ed)\b", r"\bhalide\b", r"\bchloride\b",

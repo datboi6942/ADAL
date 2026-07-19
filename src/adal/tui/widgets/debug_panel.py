@@ -47,6 +47,7 @@ class DebugPanel(Vertical):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._line_count = 0
+        self._historical_lines: list[tuple[str, int]] = []
 
     def compose(self):
         yield Static("  DEBUG (LOW)  ", id="debug-header")
@@ -56,6 +57,10 @@ class DebugPanel(Vertical):
         log = self.query_one("#debug-log", RichLog)
         count = 0
         for line, verbosity in _DEBUG_LINES:
+            if verbosity <= _CURRENT_TIER:
+                log.write(line)
+                count += 1
+        for line, verbosity in self._historical_lines:
             if verbosity <= _CURRENT_TIER:
                 log.write(line)
                 count += 1
@@ -84,18 +89,23 @@ class DebugPanel(Vertical):
             if verbosity <= _CURRENT_TIER:
                 log.write(line)
                 count += 1
+        for line, verbosity in self._historical_lines:
+            if verbosity <= _CURRENT_TIER:
+                log.write(line)
+                count += 1
         self._line_count = count
         log.scroll_end(animate=False)
 
     def write_historical(self, category: str, event: str, detail: str, timestamp: str = "",
                          verbosity: int = VERBOSITY_LOW):
-        if verbosity > _CURRENT_TIER:
-            return
         color = CATEGORY_COLORS.get(category, "white")
         prefix = f"[dim]{timestamp}[/dim]"
         tag = f"[bold {color}]{category.upper()}.{event.upper()}[/bold {color}]"
         detail_text = str(detail)[:1200].replace("\n", " ")
         line = f"{prefix} {tag} {detail_text}"
+        self._historical_lines.append((line, verbosity))
+        if verbosity > _CURRENT_TIER:
+            return
         self._line_count += 1
         was_at_end = self.query_one("#debug-log", RichLog).is_vertical_scroll_end
         self.query_one("#debug-log", RichLog).write(line)
