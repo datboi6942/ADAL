@@ -103,7 +103,7 @@ To prevent LLM death-spirals (3-6 minute tool loops chasing dead URLs):
   `deep_verify_max_tool_turns=3`, `revise_max_tool_turns=3`. Planner initial plan uses
   `planner_initial_tool_turns=0` (no tools). All configurable via `.env` / Settings UI.
 - **Per-agent timeouts** (seconds): `planner_timeout=60`, `proposer_timeout=120`,
-  `verifier_timeout=90`, `self_critique_timeout=30`, `deep_verify_timeout=45`,
+  `verifier_timeout=90`, `self_critique_timeout=60`, `deep_verify_timeout=90`,
   `revise_timeout=45`. Wall-clock bailout triggers forced final answer.
 - **Failed-tool short-circuit**: `_tool_failed()` in `client.py` detects errors (HTTP 403,
   timeout, PDF unreadable, search failed). After `tool_fail_streak_limit=3` consecutive
@@ -132,8 +132,8 @@ deep verification pass. Triggered when confidence < 0.85, verdict is PARTIAL, or
 WARNING/PARTIAL results with no fatal flaws. The deep pass uses a specialized system prompt
 (`DEEP_VERIFICATION_SYSTEM_PROMPT`) and receives only the borderline checks. Results are
 merged via `_merge_verification_results()` — upgrading borderline checks to definitive PASS/FAIL
-and adding newly discovered fatal flaws. Deep verify runs as a sub-model call with 3 tool turns
-and a 45-second timeout.
+and adding newly discovered fatal flaws. Deep verify uses the primary model with full thinking
+and 3 tool turns, with a 90-second timeout.
 
 ### In-Iteration Revision Loop
 When the Verifier returns a PARTIAL verdict with actionable `suggestions` and no `fatal_flaws`,
@@ -141,7 +141,7 @@ the orchestrator calls `proposer.revise()` — a second, focused Proposer LLM ca
 only the specific issues flagged. The revised hypothesis is re-verified immediately. If it
 passes, the hypothesis is saved; if not, normal flow continues. Max 1 revision per iteration.
 
-Revise runs as a sub-model call with 3 tool turns and a 45-second timeout, using a dedicated
+Revise uses the primary model with full thinking and 3 tool turns, with a 45-second timeout, using a dedicated
 `REVISE_SYSTEM_PROMPT` to prevent role confusion (the model thinking it should generate new
 hypotheses instead of fixing existing ones).
 
@@ -278,7 +278,7 @@ Every agent system prompt now includes a hardened TOOL USAGE POLICY section:
   `verifier_max_tool_turns=6`, `self_critique_max_tool_turns=3`,
   `deep_verify_max_tool_turns=3`, `revise_max_tool_turns=3`.
 - Per-agent timeouts (seconds): `planner_timeout=60`, `proposer_timeout=120`,
-  `verifier_timeout=90`, `self_critique_timeout=30`, `deep_verify_timeout=45`,
+  `verifier_timeout=90`, `self_critique_timeout=60`, `deep_verify_timeout=90`,
   `revise_timeout=45`.
 - `max_parallel_tools=2` — max tools executed per LLM turn.
 - `tool_fail_streak_limit=3` — consecutive failures before forced answer.
