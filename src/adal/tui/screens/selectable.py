@@ -14,6 +14,7 @@ class SelectableScreen(Screen):
         if selected and selected.strip():
             try:
                 pyperclip.copy(selected)
+                self.notify("Copied to clipboard", severity="information", timeout=1.5)
                 self.clear_selection()
             except pyperclip.PyperclipException:
                 self.notify(
