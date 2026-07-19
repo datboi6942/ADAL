@@ -16,4 +16,8 @@ class SelectableScreen(Screen):
                 pyperclip.copy(selected)
                 self.clear_selection()
             except pyperclip.PyperclipException:
-                pass
+                self.notify(
+                    "Clipboard not available — nothing copied",
+                    title="Copy",
+                    severity="warning",
+                )
