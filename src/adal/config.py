@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     planner_seed: int | None = None
 
     forced_answer_temperature: float = 0.1
+    forced_answer_time_budget: float = Field(
+        default=30.0, ge=10, le=120,
+        description="Seconds reserved within agent timeout for the forced-final-answer LLM call",
+    )
 
     search_throttle_delay: float = 2.0
     search_max_retries: int = Field(3, ge=1, le=30)

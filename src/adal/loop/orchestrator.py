@@ -838,7 +838,9 @@ class Orchestrator:
                 current_directive = directive
 
             if self._telemetry_enabled and state.iteration % settings.telemetry_interval == 0:
-                asyncio.create_task(self._run_telemetry(state))
+                snapshot = await self._build_telemetry_snapshot(state)
+                if snapshot:
+                    asyncio.create_task(self._run_telemetry(snapshot))
 
             await self._update_session(state)
             await self._dispatch_debug("db", "session_update",
@@ -1413,14 +1415,12 @@ class Orchestrator:
     def set_telemetry(self, enabled: bool):
         self._telemetry_enabled = enabled
 
-    async def _run_telemetry(self, state: LoopState):
+    async def _run_telemetry(self, snapshot: dict):
         try:
-            snapshot = await self._build_telemetry_snapshot(state)
-            if not snapshot:
-                return
+            iteration = snapshot.get("current_iteration", 0)
 
             await self._dispatch_debug("telemetry", "start",
-                f"Iter {state.iteration}: analyzing {snapshot.get('iteration_count', 0)} iterations",
+                f"Iter {iteration}: analyzing {snapshot.get('iteration_count', 0)} iterations",
                 verbosity=VERBOSITY_LOW)
 
             result = await self.debugger.observe(snapshot)
@@ -1433,7 +1433,7 @@ class Orchestrator:
                 elif sev == "med" and highest_severity not in ("high", "critical"):
                     highest_severity = "med"
 
-            await self._persist_telemetry(state, result)
+            await self._persist_telemetry(snapshot, result)
 
             await self._dispatch_debug("telemetry", "result",
                 f"Health={result.get('overall_health', '?')} "
@@ -1495,13 +1495,15 @@ class Orchestrator:
                              "genuinely truncated — that IS a real issue to flag.",
         }
 
-    async def _persist_telemetry(self, state: LoopState, result: dict):
+    async def _persist_telemetry(self, snapshot: dict, result: dict):
+        session_id = snapshot.get("session_id", "")
+        iteration = snapshot.get("current_iteration", 0)
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as db:
             patterns = result.get("patterns_detected", [])
             if patterns:
                 existing_query = select(MetaDiagnostic).where(
-                    MetaDiagnostic.session_id == state.session_id,
+                    MetaDiagnostic.session_id == session_id,
                     MetaDiagnostic.pattern_detected != "none",
                 )
                 existing_rows = (await db.execute(existing_query)).scalars().all()
@@ -1518,17 +1520,17 @@ class Orchestrator:
 
                     existing = existing_by_pattern.get(pattern_name)
                     if existing:
-                        existing.last_iteration = state.iteration
+                        existing.last_iteration = iteration
                         existing.severity = sev
                         existing.pattern_category = pattern_category
                         existing.debugger_critique = p.get("critique", "")
                         existing.system_recommendation = p.get("recommendation", "")
                     else:
                         diag = MetaDiagnostic(
-                            session_id=state.session_id,
-                            iteration=state.iteration,
-                            first_iteration=state.iteration,
-                            last_iteration=state.iteration,
+                            session_id=session_id,
+                            iteration=iteration,
+                            first_iteration=iteration,
+                            last_iteration=iteration,
                             pattern_detected=pattern_name,
                             pattern_category=pattern_category,
                             severity=sev,
@@ -1539,17 +1541,17 @@ class Orchestrator:
             else:
                 no_pattern_exists = (await db.execute(
                     select(MetaDiagnostic.id).where(
-                        MetaDiagnostic.session_id == state.session_id,
+                        MetaDiagnostic.session_id == session_id,
                         MetaDiagnostic.pattern_detected == "none",
-                        MetaDiagnostic.iteration == state.iteration,
+                        MetaDiagnostic.iteration == iteration,
                     ).limit(1)
                 )).first()
                 if not no_pattern_exists:
                     diag = MetaDiagnostic(
-                        session_id=state.session_id,
-                        iteration=state.iteration,
-                        first_iteration=state.iteration,
-                        last_iteration=state.iteration,
+                        session_id=session_id,
+                        iteration=iteration,
+                        first_iteration=iteration,
+                        last_iteration=iteration,
                         pattern_detected="none",
                         severity=DiagnosticSeverity.LOW,
                         debugger_critique="No anti-patterns detected",
@@ -1559,7 +1561,7 @@ class Orchestrator:
             await db.commit()
             count = max(len(patterns), 1)
             await self._dispatch_debug("db", "telemetry_persist",
-                f"{count} MetaDiagnostic row(s) for iter {state.iteration}",
+                f"{count} MetaDiagnostic row(s) for iter {iteration}",
                 verbosity=VERBOSITY_HIGH)
 
 

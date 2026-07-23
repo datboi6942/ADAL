@@ -202,6 +202,10 @@ async def chat_completion_with_tools(
     model_name = model or default_model
     _start_time = _time.time()
 
+    _loop_deadline = None
+    if timeout_seconds is not None:
+        _loop_deadline = timeout_seconds - settings.forced_answer_time_budget
+
     if debug_callback:
         await debug_callback("llm", "call",
             f"Model={model_name} thinking={thinking_enabled} tokens={tokens} tools={len(tools)} turns={max_tool_turns}",
@@ -220,10 +224,12 @@ async def chat_completion_with_tools(
 
     turn = 0
     for turn in range(max_tool_turns):
-        if timeout_seconds is not None and (_time.time() - _start_time) > timeout_seconds:
+        if _loop_deadline is not None and (_time.time() - _start_time) > _loop_deadline:
             if debug_callback:
                 await debug_callback("llm", "timeout",
-                    f"Agent timeout ({timeout_seconds}s) exceeded after {turn} turns — forcing final answer",
+                    f"Tool-loop deadline ({_loop_deadline:.0f}s) reached after {turn} turns "
+                    f"(reserved {settings.forced_answer_time_budget:.0f}s for forced answer within "
+                    f"{timeout_seconds:.0f}s outer deadline) — forcing final answer",
                     verbosity=1)
             break
         if debug_callback:
