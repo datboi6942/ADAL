@@ -40,7 +40,7 @@ class Proposer(BaseAgent):
 
     async def _think_smart(self, context: dict, thinking_enabled: bool = True, model: str | None = None, max_tool_turns: int | None = None, timeout_seconds: float | None = None, json_mode: bool = False) -> str:
         if self.tools:
-            return await self.think_with_tools(context, thinking_enabled=thinking_enabled, model=model, max_tool_turns=max_tool_turns or settings.proposer_max_tool_turns, timeout_seconds=timeout_seconds or settings.proposer_timeout, json_mode=json_mode)
+            return await self.think_with_tools(context, thinking_enabled=thinking_enabled, model=model, max_tool_turns=max_tool_turns if max_tool_turns is not None else settings.proposer_max_tool_turns, timeout_seconds=timeout_seconds if timeout_seconds is not None else settings.proposer_timeout, json_mode=json_mode)
         return await self.think_with_retry(context, json_mode=json_mode)
 
     async def propose(
@@ -63,7 +63,7 @@ class Proposer(BaseAgent):
         response = await self._think_smart(context, json_mode=True)
         result = self.parse_json_block(response)
 
-        if "error" in result:
+        if "error" in result and not getattr(self, '_last_was_forced', False):
             self.log.error("proposer_parse_failed", error=result["error"])
             retry_context = {**context}
             retry_context["_retry_note"] = (
@@ -71,7 +71,7 @@ class Proposer(BaseAgent):
                 "You MUST output the complete JSON response exactly as specified. "
                 "Include ALL required fields: domain, analysis_summary, hypothesis, python_script.]"
             )
-            response = await self._think_smart(retry_context, json_mode=True)
+            response = await self._think_smart(retry_context, json_mode=True, thinking_enabled=False)
             result = self.parse_json_block(response)
 
         if result.get("error"):
@@ -86,35 +86,41 @@ class Proposer(BaseAgent):
             }
 
         try:
-            if self._debug_callback:
-                await self._debug_callback("proposer", "self_critique_start",
-                    "Running self-critique checklist (stoichiometry, yield, thermo, workup, equipment, precursors, math, sensitivity)")
-            critique = await self._self_critique(result, previous_attempts, domain)
-            if critique:
-                result["_self_critique"] = critique
-                hyp = result.get("hypothesis", {})
-                if isinstance(hyp, dict):
-                    adj = critique.get("confidence_adjustment", 0)
-                    current_conf = hyp.get("confidence", 0)
-                    if isinstance(current_conf, (int, float)):
-                        hyp["confidence"] = max(0.0, min(1.0, current_conf + adj))
-                suggested_fix = critique.get("suggested_fix", "")
-                if suggested_fix:
-                    existing_summary = result.get("analysis_summary", "")
-                    result["analysis_summary"] = f"{existing_summary}\n\n[Self-Critique Correction]: {suggested_fix}"
-                issues = critique.get("issues_found", [])
-                if issues and isinstance(result.get("hypothesis"), dict):
-                    hyp_notes = result["hypothesis"].get("notes", "")
-                    result["hypothesis"]["notes"] = f"{hyp_notes}\n[Self-Critique flagged]: {'; '.join(issues[:5])}" if hyp_notes else f"[Self-Critique flagged]: {'; '.join(issues[:5])}"
+            if getattr(self, '_last_was_forced', False):
                 if self._debug_callback:
-                    for issue in issues[:8]:
-                        await self._debug_callback("proposer", "critique_item",
-                            f"Self-critique found: {issue}", verbosity=VERBOSITY_MED)
-                    if not issues:
-                        await self._debug_callback("proposer", "critique_clean",
-                            "Self-critique: no issues found", verbosity=VERBOSITY_MED)
-                    await self._debug_callback("proposer", "self_critique_done",
-                        f"Found {len(issues)} issues, confidence adjustment {critique.get('confidence_adjustment', 0):+}, applied")
+                    await self._debug_callback("proposer", "self_critique_skip",
+                        "Skipping self-critique — main proposer call hit forced answer (tool turns exhausted)",
+                        verbosity=VERBOSITY_MED)
+            else:
+                if self._debug_callback:
+                    await self._debug_callback("proposer", "self_critique_start",
+                        "Running self-critique checklist (stoichiometry, yield, thermo, workup, equipment, precursors, math, sensitivity)")
+                critique = await self._self_critique(result, previous_attempts, domain)
+                if critique:
+                    result["_self_critique"] = critique
+                    hyp = result.get("hypothesis", {})
+                    if isinstance(hyp, dict):
+                        adj = critique.get("confidence_adjustment", 0)
+                        current_conf = hyp.get("confidence", 0)
+                        if isinstance(current_conf, (int, float)):
+                            hyp["confidence"] = max(0.0, min(1.0, current_conf + adj))
+                    suggested_fix = critique.get("suggested_fix", "")
+                    if suggested_fix:
+                        existing_summary = result.get("analysis_summary", "")
+                        result["analysis_summary"] = f"{existing_summary}\n\n[Self-Critique Correction]: {suggested_fix}"
+                    issues = critique.get("issues_found", [])
+                    if issues and isinstance(result.get("hypothesis"), dict):
+                        hyp_notes = result["hypothesis"].get("notes", "")
+                        result["hypothesis"]["notes"] = f"{hyp_notes}\n[Self-Critique flagged]: {'; '.join(issues[:5])}" if hyp_notes else f"[Self-Critique flagged]: {'; '.join(issues[:5])}"
+                    if self._debug_callback:
+                        for issue in issues[:8]:
+                            await self._debug_callback("proposer", "critique_item",
+                                f"Self-critique found: {issue}", verbosity=VERBOSITY_MED)
+                        if not issues:
+                            await self._debug_callback("proposer", "critique_clean",
+                                "Self-critique: no issues found", verbosity=VERBOSITY_MED)
+                        await self._debug_callback("proposer", "self_critique_done",
+                            f"Found {len(issues)} issues, confidence adjustment {critique.get('confidence_adjustment', 0):+}, applied")
         except Exception as e:
             self.log.info("self_critique_skipped", error=str(e))
 
@@ -197,7 +203,7 @@ class Proposer(BaseAgent):
         old_system_prompt = self.system_prompt
         self.system_prompt = SELF_CRITIQUE_SYSTEM_PROMPT
         try:
-            response = await self._think_smart(context, max_tool_turns=settings.self_critique_max_tool_turns, timeout_seconds=settings.self_critique_timeout, json_mode=True)
+            response = await self._think_smart(context, max_tool_turns=settings.self_critique_max_tool_turns, timeout_seconds=settings.self_critique_timeout, json_mode=True, thinking_enabled=False, model=self.sub_model)
         finally:
             self.system_prompt = old_system_prompt
         return self.parse_json_block(response)
@@ -236,7 +242,7 @@ class Proposer(BaseAgent):
         old_system_prompt = self.system_prompt
         self.system_prompt = REVISE_SYSTEM_PROMPT
         try:
-            response = await self._think_smart(context, max_tool_turns=settings.revise_max_tool_turns, timeout_seconds=settings.revise_timeout, json_mode=True)
+            response = await self._think_smart(context, max_tool_turns=settings.revise_max_tool_turns, timeout_seconds=settings.revise_timeout, json_mode=True, thinking_enabled=False, model=self.sub_model)
         finally:
             self.system_prompt = old_system_prompt
         result = self.parse_json_block(response)

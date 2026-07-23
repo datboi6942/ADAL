@@ -72,6 +72,7 @@ class LoopState:
     hypotheses: list[dict] = field(default_factory=list)
     prior_failures: list[dict] = field(default_factory=list)
     validated_results: list[dict] = field(default_factory=list)
+    planner_decisions: list[dict] = field(default_factory=list)
     data_context: str = ""
     final_answer: str | None = None
     total_usage: dict = field(default_factory=_empty_usage)
@@ -114,7 +115,7 @@ class Orchestrator:
         except Exception:
             pass
 
-    async def _run_with_heartbeat(self, agent_name: str, coro):
+    async def _run_with_heartbeat(self, agent_name: str, coro, timeout_seconds=None):
         async def _beat():
             start = time.time()
             while True:
@@ -123,7 +124,16 @@ class Orchestrator:
                 await self._dispatch_debug(agent_name, "heartbeat", f"Working... {elapsed}s")
         beat_task = asyncio.create_task(_beat())
         try:
-            result = await coro
+            if timeout_seconds:
+                try:
+                    result = await asyncio.wait_for(coro, timeout=timeout_seconds + settings.forced_answer_grace)
+                except TimeoutError:
+                    msg = f"{agent_name} timed out after {timeout_seconds}s"
+                    logger.error("agent_timeout", agent=agent_name, timeout=timeout_seconds)
+                    await self._dispatch_debug(agent_name, "timeout", msg, verbosity=VERBOSITY_LOW)
+                    raise TimeoutError(msg)
+            else:
+                result = await coro
         finally:
             beat_task.cancel()
             try:
@@ -176,7 +186,7 @@ class Orchestrator:
         await self._wire_memory(session_id)
 
         try:
-            initial_plan = await self._run_with_heartbeat("planner", self.planner.initial_plan(query))
+            initial_plan = await self._run_with_heartbeat("planner", self.planner.initial_plan(query), timeout_seconds=settings.planner_timeout)
         except Exception as e:
             logger.error("initial_plan_failed", error=str(e))
             await self._display_step("planner", "error", f"Initial plan failed: {e}")
@@ -187,6 +197,20 @@ class Orchestrator:
             return self._build_error_result(session_id, query, str(e))
 
         domain = _safe_domain(initial_plan.get("domain_classification", "unknown"))
+
+        if initial_plan.get("action") == "fail":
+            logger.warning("initial_plan_rejected", query=query, reason=initial_plan.get("reasoning", "")[:200])
+            state.status = SessionStatus.FAILED
+            await self._update_session(state)
+            return self._build_error_result(session_id, query,
+                f"Planner rejected the query: {initial_plan.get('reasoning', 'No reason provided')[:300]}")
+        if len(query.strip()) < 12 and domain == Domain.UNKNOWN:
+            logger.warning("query_validation_failed", query=query)
+            state.status = SessionStatus.FAILED
+            await self._update_session(state)
+            return self._build_error_result(session_id, query,
+                "Query does not appear to be a valid scientific question — too short and no domain keywords matched.")
+
         plan_usage = self._capture_usage(self.planner)
         await self._display_reasoning("PLANNER", self.planner.last_reasoning, verbosity=VERBOSITY_MED)
         initial_reasoning = self.planner.last_reasoning
@@ -244,7 +268,7 @@ class Orchestrator:
                     domain=state.domain.value,
                     previous_attempts=state.prior_failures,
                     data_context=state.data_context,
-                ))
+                ), timeout_seconds=settings.proposer_timeout)
             except Exception as e:
                 logger.error("proposer_failed", error=str(e))
                 await self._display_step("proposer", "error", str(e)[:80])
@@ -260,7 +284,7 @@ class Orchestrator:
                     state.status = SessionStatus.FAILED
                     await self._update_session(state)
                     return await self._finalize(state)
-                current_directive = f"Previous proposer attempt failed with error: {e}. Try a different approach."
+                current_directive = f"[PREVIOUS ATTEMPT FAILED: {e}] Retry with same directive, fixing the error: {current_directive}"
                 await self._update_session(state)
                 await self._dispatch_debug("db", "session_update",
                     f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
@@ -318,13 +342,14 @@ class Orchestrator:
                 usage_completion=prop_usage["completion_tokens"],
             )
 
-            await self.memory_store.record_memory(
-                text=f"Proposer iteration {state.iteration}: {hypothesis_statement}",
-                session_id=session_id,
-                agent_role="proposer",
-                memory_type="episodic",
-                iteration_turn=state.iteration,
-            )
+            if state.domain != Domain.UNKNOWN:
+                await self.memory_store.record_memory(
+                    text=f"Proposer iteration {state.iteration}: {hypothesis_statement}",
+                    session_id=session_id,
+                    agent_role="proposer",
+                    memory_type="episodic",
+                    iteration_turn=state.iteration,
+                )
             await self._dispatch_debug("memory", "record", f"Proposer episodic iter {state.iteration}: {hypothesis_statement[:200]}", verbosity=VERBOSITY_MED)
 
             hypothesis_data = {
@@ -354,24 +379,42 @@ class Orchestrator:
                 "execution": str(proposal.get("execution_result", {}))[:2000],
             })
 
-            await self._display_step("verifier", "thinking", "Validating hypothesis...")
-            try:
-                verdict = await self._run_with_heartbeat("verifier", self.verifier.verify(
-                    hypothesis=hyp,
-                    analysis_context=analysis_context,
-                    domain=state.domain.value,
-                    prior_failures=state.prior_failures,
-                ))
-            except Exception as e:
-                logger.error("verifier_failed", error=str(e))
-                await self._display_step("verifier", "error", str(e)[:80])
+            sandbox_failure = not script_ok and bool(script_code)
+            if sandbox_failure:
+                await self._display_step("verifier", "skip",
+                    "Sandbox crashed — skipping LLM verification")
+                error_detail = (exe.get("error") or exe.get("stderr", "Unknown error"))[:500]
+                await self._dispatch_debug("verifier", "skip",
+                    f"sandbox_failure iter={state.iteration}: {error_detail[:200]}",
+                    verbosity=VERBOSITY_LOW)
                 verdict = {
                     "verdict": "FAIL",
-                    "confidence": 0.0,
-                    "fatal_flaws": [f"Verifier crashed: {e}"],
+                    "confidence": 1.0,
+                    "fatal_flaws": [f"Sandbox execution failed: {error_detail}"],
                     "checks_performed": [],
                     "mathematical_proof": "",
                     "corrected_values": {},
+                    "suggestions": ["Fix script errors before retrying."],
+                }
+            else:
+                await self._display_step("verifier", "thinking", "Validating hypothesis...")
+                try:
+                    verdict = await self._run_with_heartbeat("verifier", self.verifier.verify(
+                        hypothesis=hyp,
+                        analysis_context=analysis_context,
+                        domain=state.domain.value,
+                        prior_failures=state.prior_failures,
+                    ), timeout_seconds=settings.verifier_timeout)
+                except Exception as e:
+                    logger.error("verifier_failed", error=str(e))
+                    await self._display_step("verifier", "error", str(e)[:80])
+                    verdict = {
+                        "verdict": "FAIL",
+                        "confidence": 0.0,
+                        "fatal_flaws": [f"Verifier crashed: {e}"],
+                        "checks_performed": [],
+                        "mathematical_proof": "",
+                        "corrected_values": {},
                     "suggestions": [],
                     "numerical_validation": {},
                 }
@@ -473,13 +516,14 @@ class Orchestrator:
             await self._dispatch_debug("memory", "record",
                 f"Verifier episodic iter {state.iteration}: {verdict_data.get('mathematical_proof', '')[:120]}", verbosity=VERBOSITY_MED)
 
-            await self.memory_store.record_memory(
-                text=f"Verifier iteration {state.iteration}: verdict={verdict_data['verdict']} confidence={verdict_data['confidence']:.0%} flaws={len(verdict_data.get('fatal_flaws', []))}",
-                session_id=session_id,
-                agent_role="verifier",
-                memory_type="episodic",
-                iteration_turn=state.iteration,
-            )
+            if state.domain != Domain.UNKNOWN:
+                await self.memory_store.record_memory(
+                    text=f"Verifier iteration {state.iteration}: verdict={verdict_data['verdict']} confidence={verdict_data['confidence']:.0%} flaws={len(verdict_data.get('fatal_flaws', []))}",
+                    session_id=session_id,
+                    agent_role="verifier",
+                    memory_type="episodic",
+                    iteration_turn=state.iteration,
+                )
 
             if verdict_data.get("fatal_flaws"):
                 state.prior_failures.append({
@@ -497,12 +541,13 @@ class Orchestrator:
                 await self._dispatch_debug("memory", "failure_record",
                     f"Recording failure iter {state.iteration}: {state.prior_failures[-1].get('hypothesis_summary', '')[:200]}", verbosity=VERBOSITY_MED)
 
-                await self.memory_store.record_failure(
-                    text=f"Rejected hypothesis {state.iteration}: {hypothesis_statement[:200]} | Flaws: {', '.join(verdict_data['fatal_flaws'][:3])}",
-                    session_id=session_id,
-                    agent_role="verifier",
-                    iteration=state.iteration,
-                )
+                if state.domain != Domain.UNKNOWN:
+                    await self.memory_store.record_failure(
+                        text=f"Rejected hypothesis {state.iteration}: {hypothesis_statement[:200]} | Flaws: {', '.join(verdict_data['fatal_flaws'][:3])}",
+                        session_id=session_id,
+                        agent_role="verifier",
+                        iteration=state.iteration,
+                    )
             elif verdict_passed:
                 state.validated_results.append({
                     "iteration": state.iteration,
@@ -556,7 +601,7 @@ class Orchestrator:
                     await self._display_step("proposer", "thinking", "Revising based on Verifier feedback...")
                     revised = await self._run_with_heartbeat("proposer", self.proposer.revise(
                         proposal, verdict_data["suggestions"], state.domain.value
-                    ))
+                    ), timeout_seconds=settings.revise_timeout)
                     await self._dispatch_debug("fsm", "revision_proposer",
                         f"Revision proposer returned — verifier suggestions: {len(verdict_data['suggestions'])} items", verbosity=VERBOSITY_HIGH)
                     rev_usage = self._capture_usage(self.proposer)
@@ -573,7 +618,7 @@ class Orchestrator:
                         analysis_context=analysis_context,
                         domain=state.domain.value,
                         prior_failures=state.prior_failures,
-                    ))
+                    ), timeout_seconds=settings.verifier_timeout)
                     await self._dispatch_debug("fsm", "revision_verifier",
                         f"Post-revision verdict: {revised_verdict.get('verdict')} conf={revised_verdict.get('confidence', 0):.0%}", verbosity=VERBOSITY_HIGH)
                     rev_verif_usage = self._capture_usage(self.verifier)
@@ -629,6 +674,9 @@ class Orchestrator:
                     await self._display_step("proposer", "error", f"Revision crashed: {e}")
 
             await self._display_step("decision", "thinking", "Evaluating next action...")
+            planner_tool_turns = None
+            if verdict_data.get("verdict") == "PASS" and verdict_data.get("confidence", 0) >= 0.80:
+                planner_tool_turns = 0
             try:
                 planner_decision = await self._run_with_heartbeat("planner", self.planner.plan(
                     user_query=query,
@@ -645,7 +693,8 @@ class Orchestrator:
                     },
                     verdict=verdict_data,
                     hypotheses_history=state.hypotheses[-3:],
-                ))
+                    max_tool_turns=planner_tool_turns,
+                ), timeout_seconds=settings.planner_timeout)
             except Exception as e:
                 logger.warning("planner_decision_failed_first", error=str(e))
                 await self._display_step("decision", "error", f"Planner error: {str(e)[:80]} — retrying...")
@@ -665,7 +714,8 @@ class Orchestrator:
                         },
                         verdict=verdict_data,
                         hypotheses_history=state.hypotheses[-3:],
-                    ))
+                        max_tool_turns=planner_tool_turns,
+                    ), timeout_seconds=settings.planner_timeout)
                 except Exception as e2:
                     logger.error("planner_decision_failed_retry", error=str(e2))
                     await self._display_step("decision", "error", f"Planner error after retry: {str(e2)[:80]}")
@@ -697,6 +747,12 @@ class Orchestrator:
             reason = planner_decision.get("reasoning", "")
 
             await self._persist_planner_decision(hypothesis_db.id, action, directive, reason)
+            state.planner_decisions.append({
+                "iteration": state.iteration,
+                "action": action.value,
+                "directive": directive,
+                "reason": reason,
+            })
             await self._persist_interaction(
                 state, planner_decision, AgentRole.PLANNER,
                 InteractionDirection.PLANNER_TO_PROPOSER, hypothesis_db.id,
@@ -707,13 +763,14 @@ class Orchestrator:
             await self._dispatch_debug("memory", "record",
                 f"Planner episodic iter {state.iteration}: action={action.value} reason={reason[:150]}", verbosity=VERBOSITY_MED)
 
-            await self.memory_store.record_memory(
-                text=f"Planner iteration {state.iteration}: action={action.value} reason={reason[:200]}",
-                session_id=session_id,
-                agent_role="planner",
-                memory_type="episodic",
-                iteration_turn=state.iteration,
-            )
+            if state.domain != Domain.UNKNOWN:
+                await self.memory_store.record_memory(
+                    text=f"Planner iteration {state.iteration}: action={action.value} reason={reason[:200]}",
+                    session_id=session_id,
+                    agent_role="planner",
+                    memory_type="episodic",
+                    iteration_turn=state.iteration,
+                )
 
             reasoning_tag = _reasoning_tag(self.planner.last_reasoning)
             action_display = f"-> {action.value.upper()}: {reason[:120]}  {self._usage_summary(dec_usage)}{reasoning_tag}"
@@ -781,7 +838,9 @@ class Orchestrator:
                 current_directive = directive
 
             if self._telemetry_enabled and state.iteration % settings.telemetry_interval == 0:
-                asyncio.create_task(self._run_telemetry(state))
+                snapshot = await self._build_telemetry_snapshot(state)
+                if snapshot:
+                    asyncio.create_task(self._run_telemetry(snapshot))
 
             await self._update_session(state)
             await self._dispatch_debug("db", "session_update",
@@ -796,11 +855,12 @@ class Orchestrator:
 
     async def _post_mortem(self, state: LoopState):
         try:
-            await self.memory_store.summarize_and_record_lesson(
-                session_id=state.session_id,
-                hypotheses_history=state.hypotheses[-3:],
-                final_status=state.status.value,
-            )
+            if state.domain != Domain.UNKNOWN:
+                await self.memory_store.summarize_and_record_lesson(
+                    session_id=state.session_id,
+                    hypotheses_history=state.hypotheses[-3:],
+                    final_status=state.status.value,
+                )
         except Exception as e:
             logger.error("post_mortem_failed", error=str(e))
 
@@ -884,7 +944,7 @@ class Orchestrator:
                            "validated_count": len(state.validated_results)},
                     verdict=restore_verdict or None,
                     hypotheses_history=state.hypotheses[-3:],
-                ))
+                ), timeout_seconds=settings.planner_timeout)
             except Exception as e:
                 logger.error("restore_planner_failed", error=str(e))
                 return self._build_error_result(session_id, state.query, f"Planner failed on restore: {e}")
@@ -982,7 +1042,7 @@ class Orchestrator:
                     domain=state.domain.value,
                     previous_attempts=state.prior_failures,
                     data_context=state.data_context,
-                ))
+                ), timeout_seconds=settings.proposer_timeout)
             except Exception as e:
                 logger.error("proposer_failed", error=str(e))
                 await self._display_step("proposer", "error", str(e)[:80])
@@ -993,7 +1053,7 @@ class Orchestrator:
                     state.status = SessionStatus.FAILED
                     await self._update_session(state)
                     return await self._finalize(state)
-                current_directive = f"Previous proposer attempt failed with error: {e}. Try a different approach."
+                current_directive = f"[PREVIOUS ATTEMPT FAILED: {e}] Retry with same directive, fixing the error: {current_directive}"
                 await self._update_session(state)
                 await self._dispatch_debug("db", "session_update",
                     f"Session {state.session_id[:8]}: iter={state.iteration} status={state.status.value}", verbosity=VERBOSITY_HIGH)
@@ -1011,17 +1071,6 @@ class Orchestrator:
             hypothesis_summary = hypothesis_statement[:150] or proposal.get("analysis_summary", "")[:150]
             display_detail = f"{hypothesis_summary}  {self._usage_summary(prop_usage)}"
             await self._display_step("proposer", "done", display_detail)
-
-            await self._dispatch_debug("memory", "record",
-                f"Proposer episodic iter {state.iteration}: {hypothesis_statement[:200]}", verbosity=VERBOSITY_MED)
-
-            await self.memory_store.record_memory(
-                text=f"Proposer iteration {state.iteration}: {hypothesis_statement}",
-                session_id=session_id,
-                agent_role="proposer",
-                memory_type="episodic",
-                iteration_turn=state.iteration,
-            )
 
             # Short-circuit: rest goes through existing methods would be duplication.
             # Instead, persist and loop as normal.
@@ -1041,12 +1090,31 @@ class Orchestrator:
 
             analysis_context = json.dumps({"summary": proposal.get("analysis_summary", ""), "features": proposal.get("features_detected", []), "execution": str(proposal.get("execution_result", {}))[:2000]})
 
-            await self._display_step("verifier", "thinking", "Validating hypothesis...")
-            try:
-                verdict = await self._run_with_heartbeat("verifier", self.verifier.verify(hypothesis=hyp, analysis_context=analysis_context, domain=state.domain.value, prior_failures=state.prior_failures))
-            except Exception as e:
-                logger.error("verifier_failed", error=str(e))
-                verdict = {"verdict": "FAIL", "confidence": 0.0, "fatal_flaws": [f"Verifier crashed: {e}"], "checks_performed": [], "suggestions": []}
+            script_ok = proposal.get("execution_result", {}).get("success", False)
+            script_code = proposal.get("python_script", "")
+            sandbox_failure = not script_ok and bool(script_code)
+            if sandbox_failure:
+                await self._display_step("verifier", "skip",
+                    "Sandbox crashed — skipping LLM verification")
+                error_detail = (proposal.get("execution_result", {}).get("error")
+                    or proposal.get("execution_result", {}).get("stderr", "Unknown error"))[:500]
+                await self._dispatch_debug("verifier", "skip",
+                    f"sandbox_failure iter={state.iteration}: {error_detail[:200]}",
+                    verbosity=VERBOSITY_LOW)
+                verdict = {
+                    "verdict": "FAIL",
+                    "confidence": 1.0,
+                    "fatal_flaws": [f"Sandbox execution failed: {error_detail}"],
+                    "checks_performed": [],
+                    "suggestions": ["Fix script errors before retrying."],
+                }
+            else:
+                await self._display_step("verifier", "thinking", "Validating hypothesis...")
+                try:
+                    verdict = await self._run_with_heartbeat("verifier", self.verifier.verify(hypothesis=hyp, analysis_context=analysis_context, domain=state.domain.value, prior_failures=state.prior_failures), timeout_seconds=settings.verifier_timeout)
+                except Exception as e:
+                    logger.error("verifier_failed", error=str(e))
+                    verdict = {"verdict": "FAIL", "confidence": 0.0, "fatal_flaws": [f"Verifier crashed: {e}"], "checks_performed": [], "suggestions": []}
 
             verif_usage = self._capture_usage(self.verifier)
             await self._display_reasoning("VERIFIER", self.verifier.last_reasoning, verbosity=VERBOSITY_MED)
@@ -1082,13 +1150,14 @@ class Orchestrator:
             await self._dispatch_debug("memory", "record",
                 f"Verifier episodic iter {state.iteration}: {verdict_data.get('mathematical_proof', '')[:120]}", verbosity=VERBOSITY_MED)
 
-            await self.memory_store.record_memory(
-                text=f"Verifier iteration {state.iteration}: verdict={verdict_data['verdict']} confidence={verdict_data['confidence']:.0%} flaws={len(verdict_data.get('fatal_flaws', []))}",
-                session_id=session_id,
-                agent_role="verifier",
-                memory_type="episodic",
-                iteration_turn=state.iteration,
-            )
+            if state.domain != Domain.UNKNOWN:
+                await self.memory_store.record_memory(
+                    text=f"Verifier iteration {state.iteration}: verdict={verdict_data['verdict']} confidence={verdict_data['confidence']:.0%} flaws={len(verdict_data.get('fatal_flaws', []))}",
+                    session_id=session_id,
+                    agent_role="verifier",
+                    memory_type="episodic",
+                    iteration_turn=state.iteration,
+                )
 
             if verdict_data.get("fatal_flaws"):
                 state.prior_failures.append({"iteration": state.iteration, "hypothesis_summary": hypothesis_summary, "fatal_flaws": verdict_data["fatal_flaws"], "reason": "Fatal"})
@@ -1097,12 +1166,13 @@ class Orchestrator:
                 await self._dispatch_debug("memory", "failure_record",
                     f"Recording failure iter {state.iteration}: {state.prior_failures[-1].get('hypothesis_summary', '')[:200]}", verbosity=VERBOSITY_MED)
 
-                await self.memory_store.record_failure(
-                    text=f"Rejected hypothesis {state.iteration}: {hypothesis_summary[:200]} | Flaws: {', '.join(verdict_data['fatal_flaws'][:3])}",
-                    session_id=session_id,
-                    agent_role="verifier",
-                    iteration=state.iteration,
-                )
+                if state.domain != Domain.UNKNOWN:
+                    await self.memory_store.record_failure(
+                        text=f"Rejected hypothesis {state.iteration}: {hypothesis_summary[:200]} | Flaws: {', '.join(verdict_data['fatal_flaws'][:3])}",
+                        session_id=session_id,
+                        agent_role="verifier",
+                        iteration=state.iteration,
+                    )
             elif verdict_data["verdict"] == "PASS":
                 state.validated_results.append({"iteration": state.iteration, "hypothesis": hypothesis_data, "verdict": verdict_data})
                 hypothesis_db.status = HypothesisStatus.VERIFIED
@@ -1136,13 +1206,16 @@ class Orchestrator:
 
 
             await self._display_step("decision", "thinking", "Evaluating next action...")
+            planner_tool_turns2 = None
+            if verdict_data.get("verdict") == "PASS" and verdict_data.get("confidence", 0) >= 0.80:
+                planner_tool_turns2 = 0
             try:
-                planner_decision = await self._run_with_heartbeat("planner", self.planner.plan(user_query=state.query, state={"session_id": session_id, "iteration": state.iteration, "domain": state.domain.value, "status": state.status.value, "proposer_summary": proposal.get("analysis_summary", "")[:500], "sandbox_success": proposal.get("execution_result", {}).get("success", False), "sandbox_stdout": (proposal.get("execution_result", {}).get("stdout", "") or "")[:1500], "prior_failures_count": len(state.prior_failures), "validated_count": len(state.validated_results)}, verdict=verdict_data, hypotheses_history=state.hypotheses[-3:]))
+                planner_decision = await self._run_with_heartbeat("planner", self.planner.plan(user_query=state.query, state={"session_id": session_id, "iteration": state.iteration, "domain": state.domain.value, "status": state.status.value, "proposer_summary": proposal.get("analysis_summary", "")[:500], "sandbox_success": proposal.get("execution_result", {}).get("success", False), "sandbox_stdout": (proposal.get("execution_result", {}).get("stdout", "") or "")[:1500], "prior_failures_count": len(state.prior_failures), "validated_count": len(state.validated_results)}, verdict=verdict_data, hypotheses_history=state.hypotheses[-3:], max_tool_turns=planner_tool_turns2), timeout_seconds=settings.planner_timeout)
             except Exception as e:
                 logger.warning("planner_decision_failed_first", error=str(e))
                 await self._display_step("decision", "error", f"Planner error: {str(e)[:80]} — retrying...")
                 try:
-                    planner_decision = await self._run_with_heartbeat("planner_retry", self.planner.plan(user_query=state.query, state={"session_id": session_id, "iteration": state.iteration, "domain": state.domain.value, "status": state.status.value, "proposer_summary": proposal.get("analysis_summary", "")[:500], "sandbox_success": proposal.get("execution_result", {}).get("success", False), "sandbox_stdout": (proposal.get("execution_result", {}).get("stdout", "") or "")[:1500], "prior_failures_count": len(state.prior_failures), "validated_count": len(state.validated_results)}, verdict=verdict_data, hypotheses_history=state.hypotheses[-3:]))
+                    planner_decision = await self._run_with_heartbeat("planner_retry", self.planner.plan(user_query=state.query, state={"session_id": session_id, "iteration": state.iteration, "domain": state.domain.value, "status": state.status.value, "proposer_summary": proposal.get("analysis_summary", "")[:500], "sandbox_success": proposal.get("execution_result", {}).get("success", False), "sandbox_stdout": (proposal.get("execution_result", {}).get("stdout", "") or "")[:1500], "prior_failures_count": len(state.prior_failures), "validated_count": len(state.validated_results)}, verdict=verdict_data, hypotheses_history=state.hypotheses[-3:], max_tool_turns=planner_tool_turns2), timeout_seconds=settings.planner_timeout)
                 except Exception as e2:
                     logger.error("planner_decision_failed_retry", error=str(e2))
                     await self._display_step("decision", "error", f"Planner error after retry: {str(e2)[:80]}")
@@ -1170,6 +1243,12 @@ class Orchestrator:
             reason = planner_decision.get("reasoning", "")
 
             await self._persist_planner_decision(hypothesis_db.id, action, directive, reason)
+            state.planner_decisions.append({
+                "iteration": state.iteration,
+                "action": action.value,
+                "directive": directive,
+                "reason": reason,
+            })
             planner_decision["_reasoning"] = self.planner.last_reasoning
             await self._persist_interaction(state, planner_decision, AgentRole.PLANNER, InteractionDirection.PLANNER_TO_PROPOSER, hypothesis_db.id)
 
@@ -1178,13 +1257,14 @@ class Orchestrator:
             await self._dispatch_debug("memory", "record",
                 f"Planner episodic iter {state.iteration}: action={action.value} reason={reason[:150]}", verbosity=VERBOSITY_MED)
 
-            await self.memory_store.record_memory(
-                text=f"Planner iteration {state.iteration}: action={action.value} reason={reason[:200]}",
-                session_id=session_id,
-                agent_role="planner",
-                memory_type="episodic",
-                iteration_turn=state.iteration,
-            )
+            if state.domain != Domain.UNKNOWN:
+                await self.memory_store.record_memory(
+                    text=f"Planner iteration {state.iteration}: action={action.value} reason={reason[:200]}",
+                    session_id=session_id,
+                    agent_role="planner",
+                    memory_type="episodic",
+                    iteration_turn=state.iteration,
+                )
 
             reasoning_tag = _reasoning_tag(self.planner.last_reasoning)
             action_display = f"-> {action.value.upper()}: {reason[:120]}  {self._usage_summary(dec_usage)}{reasoning_tag}"
@@ -1335,14 +1415,12 @@ class Orchestrator:
     def set_telemetry(self, enabled: bool):
         self._telemetry_enabled = enabled
 
-    async def _run_telemetry(self, state: LoopState):
+    async def _run_telemetry(self, snapshot: dict):
         try:
-            snapshot = await self._build_telemetry_snapshot(state)
-            if not snapshot:
-                return
+            iteration = snapshot.get("current_iteration", 0)
 
             await self._dispatch_debug("telemetry", "start",
-                f"Iter {state.iteration}: analyzing {snapshot.get('iteration_count', 0)} iterations",
+                f"Iter {iteration}: analyzing {snapshot.get('iteration_count', 0)} iterations",
                 verbosity=VERBOSITY_LOW)
 
             result = await self.debugger.observe(snapshot)
@@ -1355,7 +1433,7 @@ class Orchestrator:
                 elif sev == "med" and highest_severity not in ("high", "critical"):
                     highest_severity = "med"
 
-            await self._persist_telemetry(state, result)
+            await self._persist_telemetry(snapshot, result)
 
             await self._dispatch_debug("telemetry", "result",
                 f"Health={result.get('overall_health', '?')} "
@@ -1387,14 +1465,18 @@ class Orchestrator:
                     v = vr
                     break
             verdict = v.get("verdict", {}) if v else {}
+            exec_result = h.get("execution_result", {}) or {}
             iterations.append({
                 "iteration": i + 1,
-                "hypothesis_statement": str(h.get("hypothesis", {}).get("statement", ""))[:500],
-                "analysis_summary": str(h.get("analysis_summary", ""))[:300],
+                "hypothesis_statement": str(h.get("hypothesis", {}).get("statement", "")),
+                "analysis_summary": str(h.get("analysis_summary", "")),
                 "verdict": verdict.get("verdict", "UNKNOWN"),
                 "confidence": verdict.get("confidence", 0.0),
                 "fatal_flaws": verdict.get("fatal_flaws", []),
                 "suggestions": verdict.get("suggestions", []),
+                "sandbox_success": exec_result.get("success", False),
+                "sandbox_stdout": str(exec_result.get("stdout", "") or "")[:1000],
+                "features_detected": list(h.get("features_detected", []) or []),
             })
         return {
             "session_id": state.session_id,
@@ -1405,42 +1487,81 @@ class Orchestrator:
             "iterations": iterations,
             "total_failures": len(state.prior_failures),
             "total_validated": len(state.validated_results),
+            "planner_decisions": state.planner_decisions[-5:],
+            "snapshot_note": "All analysis_summary and hypothesis_statement text in this snapshot is "
+                             "FULL and UNTRUNCATED — straight from the actual hypothesis objects. "
+                             "Sandbox stdout is capped at 1000 chars for brevity. "
+                             "If text appears to end mid-sentence, the original LLM output was "
+                             "genuinely truncated — that IS a real issue to flag.",
         }
 
-    async def _persist_telemetry(self, state: LoopState, result: dict):
+    async def _persist_telemetry(self, snapshot: dict, result: dict):
+        session_id = snapshot.get("session_id", "")
+        iteration = snapshot.get("current_iteration", 0)
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as db:
             patterns = result.get("patterns_detected", [])
             if patterns:
+                existing_query = select(MetaDiagnostic).where(
+                    MetaDiagnostic.session_id == session_id,
+                    MetaDiagnostic.pattern_detected != "none",
+                )
+                existing_rows = (await db.execute(existing_query)).scalars().all()
+                existing_by_pattern = {e.pattern_detected: e for e in existing_rows}
+
                 for p in patterns:
                     sev_str = (p.get("severity") or "low").lower()
                     try:
                         sev = DiagnosticSeverity(sev_str)
                     except ValueError:
                         sev = DiagnosticSeverity.LOW
+                    pattern_name = p.get("pattern", "unknown")
+                    pattern_category = (p.get("pattern_category") or "other").lower()
+
+                    existing = existing_by_pattern.get(pattern_name)
+                    if existing:
+                        existing.last_iteration = iteration
+                        existing.severity = sev
+                        existing.pattern_category = pattern_category
+                        existing.debugger_critique = p.get("critique", "")
+                        existing.system_recommendation = p.get("recommendation", "")
+                    else:
+                        diag = MetaDiagnostic(
+                            session_id=session_id,
+                            iteration=iteration,
+                            first_iteration=iteration,
+                            last_iteration=iteration,
+                            pattern_detected=pattern_name,
+                            pattern_category=pattern_category,
+                            severity=sev,
+                            debugger_critique=p.get("critique", ""),
+                            system_recommendation=p.get("recommendation", ""),
+                        )
+                        db.add(diag)
+            else:
+                no_pattern_exists = (await db.execute(
+                    select(MetaDiagnostic.id).where(
+                        MetaDiagnostic.session_id == session_id,
+                        MetaDiagnostic.pattern_detected == "none",
+                        MetaDiagnostic.iteration == iteration,
+                    ).limit(1)
+                )).first()
+                if not no_pattern_exists:
                     diag = MetaDiagnostic(
-                        session_id=state.session_id,
-                        iteration=state.iteration,
-                        pattern_detected=p.get("pattern", "unknown"),
-                        severity=sev,
-                        debugger_critique=p.get("critique", ""),
-                        system_recommendation=p.get("recommendation", ""),
+                        session_id=session_id,
+                        iteration=iteration,
+                        first_iteration=iteration,
+                        last_iteration=iteration,
+                        pattern_detected="none",
+                        severity=DiagnosticSeverity.LOW,
+                        debugger_critique="No anti-patterns detected",
+                        system_recommendation="",
                     )
                     db.add(diag)
-            else:
-                diag = MetaDiagnostic(
-                    session_id=state.session_id,
-                    iteration=state.iteration,
-                    pattern_detected="none",
-                    severity=DiagnosticSeverity.LOW,
-                    debugger_critique="No anti-patterns detected",
-                    system_recommendation="",
-                )
-                db.add(diag)
             await db.commit()
             count = max(len(patterns), 1)
             await self._dispatch_debug("db", "telemetry_persist",
-                f"{count} MetaDiagnostic row(s) for iter {state.iteration}",
+                f"{count} MetaDiagnostic row(s) for iter {iteration}",
                 verbosity=VERBOSITY_HIGH)
 
 

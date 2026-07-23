@@ -104,7 +104,7 @@ async def delete_session(session_id: str):
             await db.commit()
 
 
-async def get_meta_diagnostics(severity: str | None = None, limit: int = 200):
+async def get_meta_diagnostics(severity: str | None = None, pattern_category: str | None = None, limit: int = 200):
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as db:
         stmt = (
@@ -118,6 +118,8 @@ async def get_meta_diagnostics(severity: str | None = None, limit: int = 200):
                 stmt = stmt.where(MetaDiagnostic.severity == sev)
             except ValueError:
                 pass
+        if pattern_category:
+            stmt = stmt.where(MetaDiagnostic.pattern_category == pattern_category)
         result = await db.execute(stmt.limit(limit))
         return result.all()
 

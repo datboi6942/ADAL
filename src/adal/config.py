@@ -88,6 +88,14 @@ class Settings(BaseSettings):
     planner_seed: int | None = None
 
     forced_answer_temperature: float = 0.1
+    forced_answer_time_budget: float = Field(
+        default=30.0, ge=10, le=120,
+        description="Seconds reserved within agent timeout for the forced-final-answer LLM call",
+    )
+    forced_answer_grace: float = Field(
+        default=15.0, ge=5, le=60,
+        description="Seconds added to the outer agent deadline to prevent cancellation of the internal forced-answer",
+    )
 
     search_throttle_delay: float = 2.0
     search_max_retries: int = Field(3, ge=1, le=30)
@@ -107,10 +115,10 @@ class Settings(BaseSettings):
 
     planner_max_tool_turns: int = 2
     planner_initial_tool_turns: int = 0
-    proposer_max_tool_turns: int = 6
-    verifier_max_tool_turns: int = 6
-    self_critique_max_tool_turns: int = 3
-    deep_verify_max_tool_turns: int = 3
+    proposer_max_tool_turns: int = 1
+    verifier_max_tool_turns: int = 3
+    self_critique_max_tool_turns: int = 2
+    deep_verify_max_tool_turns: int = 2
     revise_max_tool_turns: int = 3
 
     planner_timeout: float = 60.0

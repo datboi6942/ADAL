@@ -30,6 +30,7 @@ dependencies = [
     "pyarrow>=24.0.0",
     "textual>=8.2.8",
     "pyperclip>=1.9",
+    "scikit-learn>=1.5",
 ]
 
 [project.optional-dependencies]

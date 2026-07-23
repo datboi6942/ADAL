@@ -61,6 +61,20 @@ class DiagnosticSeverity(enum.StrEnum):
     CRITICAL = "critical"
 
 
+class TelemetryPattern(enum.StrEnum):
+    SUNK_COST = "sunk_cost"
+    PING_PONG = "ping_pong"
+    TOOL_HYPERFIXATION = "tool_hyperfixation"
+    FEEDBACK_BLINDNESS = "feedback_blindness"
+    PREMATURE_CONVERGENCE = "premature_convergence"
+    DOMAIN_DRIFT = "domain_drift"
+    PLANNER_FIXATION = "planner_fixation"
+    OVER_VALIDATION = "over_validation"
+    OUTPUT_TRUNCATION = "output_truncation"
+    REPETITIVE_FAILURE = "repetitive_failure"
+    OTHER = "other"
+
+
 class Session(Base):
     __tablename__ = "sessions"
 
@@ -171,7 +185,10 @@ class MetaDiagnostic(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), nullable=False)
     iteration: Mapped[int] = mapped_column(Integer, nullable=False)
+    first_iteration: Mapped[int] = mapped_column(Integer, default=0)
+    last_iteration: Mapped[int] = mapped_column(Integer, default=0)
     pattern_detected: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    pattern_category: Mapped[str] = mapped_column(String(32), nullable=False, default="other")
     severity: Mapped[DiagnosticSeverity] = mapped_column(Enum(DiagnosticSeverity), default=DiagnosticSeverity.LOW)
     debugger_critique: Mapped[str] = mapped_column(Text, nullable=False, default="")
     system_recommendation: Mapped[str] = mapped_column(Text, nullable=False, default="")

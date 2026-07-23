@@ -34,7 +34,7 @@ class CommandInput(TextArea):
         self._history_idx: int = 0
 
     @property
-    def query(self) -> str:
+    def command_text(self) -> str:
         return self.text.strip()
 
     def clear_query(self):

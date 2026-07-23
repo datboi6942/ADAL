@@ -4,6 +4,7 @@ import json
 import time as _time
 from dataclasses import dataclass, field
 
+import httpx
 import structlog
 from openai import AsyncOpenAI
 
@@ -61,13 +62,16 @@ class LLMResponse:
     content: str
     reasoning: str | None = None
     usage: dict = field(default_factory=dict)
+    was_forced: bool = False
+    tool_turns_used: int = 0
 
 
 def get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
         api_key, base_url, _ = _resolve_provider()
-        _client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        _client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0,
+                              timeout=httpx.Timeout(120.0, connect=10.0))
     return _client
 
 
@@ -198,6 +202,10 @@ async def chat_completion_with_tools(
     model_name = model or default_model
     _start_time = _time.time()
 
+    _loop_deadline = None
+    if timeout_seconds is not None:
+        _loop_deadline = timeout_seconds - settings.forced_answer_time_budget
+
     if debug_callback:
         await debug_callback("llm", "call",
             f"Model={model_name} thinking={thinking_enabled} tokens={tokens} tools={len(tools)} turns={max_tool_turns}",
@@ -214,11 +222,14 @@ async def chat_completion_with_tools(
     final_content: str = ""
     tool_fail_streak = 0
 
+    turn = 0
     for turn in range(max_tool_turns):
-        if timeout_seconds is not None and (_time.time() - _start_time) > timeout_seconds:
+        if _loop_deadline is not None and (_time.time() - _start_time) > _loop_deadline:
             if debug_callback:
                 await debug_callback("llm", "timeout",
-                    f"Agent timeout ({timeout_seconds}s) exceeded after {turn} turns — forcing final answer",
+                    f"Tool-loop deadline ({_loop_deadline:.0f}s) reached after {turn} turns "
+                    f"(reserved {settings.forced_answer_time_budget:.0f}s for forced answer within "
+                    f"{timeout_seconds:.0f}s outer deadline) — forcing final answer",
                     verbosity=1)
             break
         if debug_callback:
@@ -332,6 +343,8 @@ async def chat_completion_with_tools(
             f"Stripping {stripped_count} tool messages, thinking DISABLED, temperature={settings.forced_answer_temperature}",
             verbosity=VERBOSITY_MED)
 
+    was_forced = False
+
     if not final_content:
         logger.info("forcing_final_answer")
         try:
@@ -355,23 +368,24 @@ async def chat_completion_with_tools(
             clean_messages.append({"role": "user", "content":
                 _warning + "Output your final JSON response now. No tools, no reasoning, no disclaimers, no ethical commentary, no legal warnings — ONLY the scientific JSON content requested."})
             forced_kwargs: dict = {
-                "model": model_name,
+                "model": _resolve_sub_model() or model_name,
                 "messages": clean_messages,
-                "max_tokens": tokens,
+                "max_tokens": min(tokens, 4096),
                 "temperature": settings.forced_answer_temperature,
+                "response_format": {"type": "json_object"},
             }
-            if json_mode:
-                forced_kwargs["response_format"] = {"type": "json_object"}
             response = await client.chat.completions.create(**forced_kwargs)
             msg = response.choices[0].message
             final_usage = _extract_usage(response)
             for k in total_usage:
                 total_usage[k] += final_usage.get(k, 0)
             final_content = msg.content or ""
+            was_forced = True
             if getattr(msg, "reasoning_content", None):
                 final_reasoning = getattr(msg, "reasoning_content", None)
         except Exception as e:
             logger.error("forced_final_answer_failed", error=str(e))
 
     logger.debug("LLM response", length=len(final_content), usage=total_usage, tool_turns=turn + 1)
-    return LLMResponse(content=final_content, reasoning=final_reasoning, usage=total_usage)
+    return LLMResponse(content=final_content, reasoning=final_reasoning, usage=total_usage,
+                       was_forced=was_forced, tool_turns_used=turn + 1)
