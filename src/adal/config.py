@@ -92,6 +92,10 @@ class Settings(BaseSettings):
         default=30.0, ge=10, le=120,
         description="Seconds reserved within agent timeout for the forced-final-answer LLM call",
     )
+    forced_answer_grace: float = Field(
+        default=15.0, ge=5, le=60,
+        description="Seconds added to the outer agent deadline to prevent cancellation of the internal forced-answer",
+    )
 
     search_throttle_delay: float = 2.0
     search_max_retries: int = Field(3, ge=1, le=30)

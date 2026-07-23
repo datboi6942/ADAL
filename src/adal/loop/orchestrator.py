@@ -126,7 +126,7 @@ class Orchestrator:
         try:
             if timeout_seconds:
                 try:
-                    result = await asyncio.wait_for(coro, timeout=timeout_seconds)
+                    result = await asyncio.wait_for(coro, timeout=timeout_seconds + settings.forced_answer_grace)
                 except TimeoutError:
                     msg = f"{agent_name} timed out after {timeout_seconds}s"
                     logger.error("agent_timeout", agent=agent_name, timeout=timeout_seconds)
