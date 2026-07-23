@@ -87,7 +87,7 @@ class IterationCard(Static):
 
     def shake(self):
         self._shake_idx = 0
-        self.styles.color = "$error"
+        self.styles.tint = "red"
         self._shake_timer = self.set_interval(0.05, self._shake_tick)
         self.set_timer(0.4, self._clear_shake_tint)
 
@@ -114,7 +114,7 @@ class IterationCard(Static):
             self.styles.margin = (0, 0, 0, 0)
 
     def _clear_shake_tint(self):
-        self.styles.color = "$text"
+        self.styles.tint = "transparent"
 
     def _start_pulse(self):
         if self._pulse_timer is None:

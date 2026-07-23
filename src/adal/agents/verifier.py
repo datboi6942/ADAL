@@ -47,7 +47,7 @@ class Verifier(BaseAgent):
 
     async def _think_smart(self, context: dict, thinking_enabled: bool = True, model: str | None = None, max_tool_turns: int | None = None, timeout_seconds: float | None = None, json_mode: bool = False) -> str:
         if self.tools:
-            return await self.think_with_tools(context, max_tokens=49152, thinking_enabled=thinking_enabled, model=model, max_tool_turns=max_tool_turns or settings.verifier_max_tool_turns, timeout_seconds=timeout_seconds or settings.verifier_timeout, json_mode=json_mode)
+            return await self.think_with_tools(context, max_tokens=49152, thinking_enabled=thinking_enabled, model=model, max_tool_turns=max_tool_turns if max_tool_turns is not None else settings.verifier_max_tool_turns, timeout_seconds=timeout_seconds if timeout_seconds is not None else settings.verifier_timeout, json_mode=json_mode)
         return await self.think_with_retry(context, max_tokens=49152, json_mode=json_mode)
 
     async def verify(
@@ -107,7 +107,7 @@ class Verifier(BaseAgent):
         response = await self._think_smart(context, json_mode=True)
         result = self.parse_json_block(response)
 
-        if "error" in result:
+        if "error" in result and not getattr(self, '_last_was_forced', False):
             self.log.error("verifier_parse_failed", error=result["error"])
             retry_context = {**context}
             retry_context["_retry_note"] = (
@@ -115,7 +115,7 @@ class Verifier(BaseAgent):
                 "You MUST output the complete JSON response with ALL required fields: "
                 "verdict, confidence, checks_performed, mathematical_proof, fatal_flaws, suggestions.]"
             )
-            response = await self._think_smart(retry_context, json_mode=True)
+            response = await self._think_smart(retry_context, json_mode=True, thinking_enabled=False)
             result = self.parse_json_block(response)
 
         if result.get("error"):
@@ -189,11 +189,14 @@ class Verifier(BaseAgent):
         return base + retry if retry else base
 
     def _should_deep_verify(self, result: dict) -> bool:
+        if getattr(self, '_last_was_forced', False):
+            return False
+
         verdict = result.get("verdict", "UNKNOWN")
         confidence = result.get("confidence", 1.0)
         fatal_flaws = result.get("fatal_flaws", [])
 
-        if verdict == "PASS" and confidence >= 0.85:
+        if verdict == "PASS" and confidence >= 0.75:
             return False
         if verdict == "FAIL" and fatal_flaws:
             return False

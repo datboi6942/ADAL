@@ -107,10 +107,10 @@ class Settings(BaseSettings):
 
     planner_max_tool_turns: int = 2
     planner_initial_tool_turns: int = 0
-    proposer_max_tool_turns: int = 6
-    verifier_max_tool_turns: int = 6
-    self_critique_max_tool_turns: int = 3
-    deep_verify_max_tool_turns: int = 3
+    proposer_max_tool_turns: int = 1
+    verifier_max_tool_turns: int = 3
+    self_critique_max_tool_turns: int = 2
+    deep_verify_max_tool_turns: int = 2
     revise_max_tool_turns: int = 3
 
     planner_timeout: float = 60.0

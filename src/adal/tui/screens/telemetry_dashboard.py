@@ -3,7 +3,7 @@ import asyncio
 from textual.containers import VerticalScroll
 from textual.widgets import Footer, Header, Select, Static
 
-from adal.db.models import DiagnosticSeverity
+from adal.db.models import DiagnosticSeverity, TelemetryPattern
 from adal.tui.db_queries import get_diagnostic_stats, get_meta_diagnostics
 from adal.tui.screens.selectable import SelectableScreen
 
@@ -76,15 +76,23 @@ class TelemetryDashboardScreen(SelectableScreen):
                 value="",
                 id="severity-filter",
             )
+            yield Select(
+                [("All Categories", "")] + [
+                    (cat.value.replace("_", " ").title(), cat.value)
+                    for cat in TelemetryPattern
+                ],
+                value="",
+                id="category-filter",
+            )
             yield VerticalScroll(id="telemetry-results")
         yield Footer()
 
     def on_mount(self):
         asyncio.create_task(self._load())
 
-    async def _load(self, severity: str | None = None):
+    async def _load(self, severity: str | None = None, pattern_category: str | None = None):
         stats = await get_diagnostic_stats()
-        results = await get_meta_diagnostics(severity=severity)
+        results = await get_meta_diagnostics(severity=severity, pattern_category=pattern_category)
         self._diagnostics = list(results)
 
         stats_parts = []
@@ -127,19 +135,31 @@ class TelemetryDashboardScreen(SelectableScreen):
             session_label = (session_query or "?")[:60]
             domain_str = f" [{session_domain}]" if session_domain else ""
 
+            first_iter = getattr(diag, "first_iteration", 0) or 0
+            last_iter = getattr(diag, "last_iteration", 0) or 0
+            if first_iter and last_iter and first_iter != last_iter:
+                iter_label = f"iters {first_iter}–{last_iter}"
+            else:
+                iter_label = f"iter {diag.iteration}"
+            pattern_cat = getattr(diag, "pattern_category", "")
+            cat_label = f"[dim italic]({pattern_cat.replace('_', ' ')})[/dim italic] " if pattern_cat and pattern_cat != "other" else ""
+
             lines = [
-                f"[{color}]{icon} [{sev.value.upper()}] iter {diag.iteration}: {diag.pattern_detected}[/{color}]",
+                f"[{color}]{icon} [{sev.value.upper()}] {iter_label}: {cat_label}{diag.pattern_detected}[/{color}]",
                 f"[dim]Session {diag.session_id[:8]}{domain_str}: \"{session_label}\"[/dim]",
             ]
             if diag.debugger_critique:
                 lines.append(f"[dim italic]{diag.debugger_critique[:300]}[/dim italic]")
             if diag.system_recommendation:
-                lines.append(f"[dim]\u2192 {diag.system_recommendation[:200]}[/dim]")
+                lines.append(f"[dim]\u2192 [LLM observation] {diag.system_recommendation[:200]}[/dim]")
 
             entry = Static("\n".join(lines), classes="diag-entry")
             container.mount(entry)
 
     def on_select_changed(self, event: Select.Changed):
         if event.select.id == "severity-filter":
-            val = event.value
-            asyncio.create_task(self._load(severity=val if val else None))
+            cat_val = self.query_one("#category-filter", Select).value
+            asyncio.create_task(self._load(severity=event.value if event.value else None, pattern_category=cat_val if cat_val else None))
+        elif event.select.id == "category-filter":
+            sev_val = self.query_one("#severity-filter", Select).value
+            asyncio.create_task(self._load(severity=sev_val if sev_val else None, pattern_category=event.value if event.value else None))

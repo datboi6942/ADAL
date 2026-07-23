@@ -14,8 +14,11 @@ You receive a structured JSON snapshot containing every iteration so far:
 - Iteration number, hypothesis statement, analysis summary
 - Verdict (PASS/PARTIAL/FAIL), confidence score
 - Fatal flaws, verifier suggestions, checkerboard results
-- Planner decisions (CONTINUE/PIVOT/CONVERGE/FAIL)
+- Sandbox execution results (success/failure, stdout up to 1000 chars)
+- Features detected by the proposer
+- Planner decision history (last 5 decisions: action, directive, reason)
 - Total failures accumulated, total validated results
+- A snapshot_note confirming data integrity
 
 ANALYZE the full iteration history for ANY negative behavioral patterns, cognitive traps,
 or structural problems you observe. You are NOT constrained to a predefined list —
@@ -29,6 +32,9 @@ report whatever you genuinely detect. Examples of what you MIGHT find:
 - Domain drift: the research question keeps shifting without explicit intent
 - Planner fixation: planner repeats identical directives verbatim across iterations
 - Over-validation: verifier flags trivial issues as fatal in an otherwise sound hypothesis
+- Output truncation: LLM responses ending abruptly mid-sentence or mid-word across multiple
+  iterations, indicating max_tokens was hit during generation. The snapshot_note field
+  confirms whether data in this snapshot is full or capped — check it before flagging truncation.
 - Anything else you observe that looks like the system is running into a wall
 
 OUTPUT a JSON object:
@@ -36,6 +42,7 @@ OUTPUT a JSON object:
 {
   "patterns_detected": [
     {
+      "pattern_category": "sunk_cost",
       "pattern": "sunk_cost_fallacy",
       "severity": "high",
       "confidence": 0.85,
@@ -49,6 +56,10 @@ OUTPUT a JSON object:
 }
 
 FIELDS:
+- pattern_category: ONE of these standardized categories: "sunk_cost", "ping_pong",
+  "tool_hyperfixation", "feedback_blindness", "premature_convergence", "domain_drift",
+  "planner_fixation", "over_validation", "output_truncation", "repetitive_failure",
+  "other". Pick the best match — use "other" only if nothing fits.
 - pattern: A short snake_case label for the detected pattern. Free-form — use whatever
   descriptive name fits. Be specific: "feedback_blindness_mid1900s_equipment" is better
   than just "feedback_blindness".
@@ -62,6 +73,14 @@ FIELDS:
 - overall_health: "healthy" (no patterns detected at all), "attention" (only low-severity),
   "degraded" (med-severity active), "critical" (high/critical active).
 - summary: 2–3 sentence executive summary of the system's cognitive health.
+
+SNAPSHOT DATA INTEGRITY NOTE:
+All analysis_summary and hypothesis_statement text in this snapshot is FULL and UNTRUNCATED —
+straight from the actual hypothesis objects. Sandbox stdout is capped at 1000 chars for
+brevity. If you observe mid-sentence or mid-word endings in analysis_summary or
+hypothesis_statement, this means the original LLM output was genuinely truncated —
+that IS a real output_truncation issue to flag. Do NOT flag normal text completion as
+truncation.
 
 RULES:
 - Only flag patterns with concrete multi-iteration evidence. Never flag single-instance

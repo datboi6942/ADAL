@@ -100,10 +100,10 @@ class Planner(BaseAgent):
         if settings.planner_seed is not None:
             self.gen_params["seed"] = settings.planner_seed
 
-    async def _think_smart(self, context: dict, thinking_enabled: bool = True, model: str | None = None, max_tool_turns: int | None = None, timeout_seconds: float | None = None) -> str:
-        if self.tools:
-            return await self.think_with_tools(context, thinking_enabled=thinking_enabled, model=model, max_tool_turns=max_tool_turns or settings.planner_max_tool_turns, timeout_seconds=timeout_seconds or settings.planner_timeout)
-        return await self.think_with_retry(context)
+    async def _think_smart(self, context: dict, thinking_enabled: bool = True, model: str | None = None, max_tool_turns: int | None = None, timeout_seconds: float | None = None, json_mode: bool = False) -> str:
+        if self.tools and (max_tool_turns is None or max_tool_turns > 0):
+            return await self.think_with_tools(context, thinking_enabled=thinking_enabled, model=model, max_tool_turns=max_tool_turns if max_tool_turns is not None else settings.planner_max_tool_turns, timeout_seconds=timeout_seconds if timeout_seconds is not None else settings.planner_timeout, json_mode=json_mode)
+        return await self.think_with_retry(context, json_mode=json_mode)
 
     def classify_domain(self, query: str) -> Domain:
         query_lower = query.lower()
@@ -168,10 +168,10 @@ class Planner(BaseAgent):
                 f"sandbox={'OK' if state.get('sandbox_success') == 'True' else 'FAIL' if state.get('sandbox_success') == 'False' else 'N/A'} "
                 f"proposer_summary={'present' if state.get('proposer_summary') else 'none'}",
                 verbosity=VERBOSITY_MED)
-        response = await self._think_smart(context, max_tool_turns=max_tool_turns, timeout_seconds=timeout_seconds)
+        response = await self._think_smart(context, max_tool_turns=max_tool_turns, timeout_seconds=timeout_seconds, json_mode=True)
         result = self.parse_json_block(response)
 
-        if "error" in result:
+        if "error" in result and not getattr(self, '_last_was_forced', False):
             self.log.error("planner_parse_failed", error=result["error"])
             if self._debug_callback:
                 await self._debug_callback("planner", "retry",

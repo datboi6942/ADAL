@@ -237,6 +237,8 @@ class BaseAgent(ABC):
         )
         self.total_usage = _merge_usage(self.total_usage, response.usage)
         self.last_reasoning = response.reasoning
+        self._last_was_forced = response.was_forced
+        self._last_tool_turns = response.tool_turns_used
         content = response.content
 
         if _detect_refusal(content):
